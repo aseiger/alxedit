@@ -61,7 +61,65 @@ alxedit2 --root ~/src/myproject main.py   # explicit working dir + a file
 | `ctrl+shift+s`  | Save as…                        |
 | `f4` / `ctrl+w` | Close tab                       |
 | `ctrl+q`        | Quit                            |
+| `f2`            | External changes (review & revert)|
 | `f1`            | Help                            |
+
+## External change tracking (AI-agent aware)
+
+alxedit2 watches the project tree for changes made **outside** the editor —
+for example an AI agent writing files while you watch. Every 0.8 s the tree
+is scanned; dot-dirs, `__pycache__`/`node_modules`, and files over 1 MB are
+ignored, and saves made by alxedit2 itself are never flagged.
+
+When something changes you get a toast, a `⚑n` counter in the status bar,
+and a `†` on any open tab whose file diverged from disk.
+
+If the file is already open, the tab **immediately switches to a diff
+review** — there is no separate diff window. Both sides are painted into
+the tab:
+
+- **green line** — the side a plain save would write (the agent's new
+  content for a clean buffer, your own lines for a buffer with unsaved
+  edits);
+- **`⌫` red struck-through line** — a *ghost* line: content that exists
+  only on the other side;
+- unmarked lines — unchanged context.
+
+A **hunk bar** appears on the right with one row per contiguous change
+block:
+
+- **theirs** — adopt the external (agent) side of that block;
+- **mine** — keep your side of that block.
+
+The view updates as you decide; once every block is decided, the tab
+becomes a normal editable editor holding the merged content. Alternatives:
+
+- **`ctrl+s` save** — pending blocks resolve the way a plain save would
+  (the green + context lines are written, `⌫` ghosts dropped), so saving
+  never loses your unsaved edits;
+- **`esc` / `ctrl+d`** — abandon the review: a clean buffer adopts the new
+  disk content (approved), a dirty buffer restores your unsaved edits —
+  never lost.
+
+If the agent keeps writing, the review **updates live**.
+
+Files that are **not open** yet only appear in the changes list — press
+**`f2`** (or the **Changes** button):
+
+| Key     | Action                                                        |
+| ------- | ------------------------------------------------------------- |
+| `enter` | Open the file and start the diff review in its editor tab   |
+| `o`     | Open the file in the editor (plain view)                      |
+| `r`     | Revert — restore the original, or delete an agent-added file  |
+| `q`     | Back to the editor                                            |
+
+You can also press `ctrl+d`/`esc` in a file directly to toggle its diff
+when one is tracked.
+
+"Revert" restores the file to the last content you approved in alxedit2
+(session start or your most recent save). Files the agent *added* are
+deleted; files it *deleted* are restored. If a tab has unsaved edits,
+you are asked before they are discarded.
 
 ## Syntax highlighting
 
