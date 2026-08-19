@@ -11,6 +11,7 @@ import difflib
 import shutil
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Callable, ClassVar, Iterable, Optional
 
@@ -1315,6 +1316,7 @@ class AlxEditApp(App):
         if sid is None:
             return
         now = time.monotonic()
+        flagged: list[Path] = []
         disk = self._iter_tracked_files()
         disk_set = set(disk)
         for path in disk:
@@ -1323,6 +1325,7 @@ class AlxEditApp(App):
             if not self._mirror_exists(path):
                 # new file, added after the session snapshot
                 self._changes[path] = ChangeRecord(path, "added", None, now)
+                flagged.append(path)
                 continue
             try:
                 cur = path.read_text(encoding="utf-8")
@@ -1333,6 +1336,7 @@ class AlxEditApp(App):
                 self._changes[path] = ChangeRecord(
                     path, "modified", base, now
                 )
+                flagged.append(path)
         # files in the mirror but gone from disk
         files_dir = sessions.session_dir(self.root, sid) / "files"
         if files_dir.is_dir():
@@ -1348,6 +1352,10 @@ class AlxEditApp(App):
                     sessions.read_mirror_text(self.root, sid, path),
                     now,
                 )
+                flagged.append(path)
+        # A flagged file inside a collapsed folder must not hide itself.
+        for path in flagged:
+            self._expand_path_in_explorer(path)
 
     async def _do_session_pick(self) -> None:
         """Top-bar Session button: switch to / create / delete sessions."""
@@ -2190,24 +2198,27 @@ class AlxEditApp(App):
         if not modified and not deleted:
             return
         tree_touched = False
-        changed = False
+        changed_paths: list[Path] = []
         for path in modified:
             if now - self._self_writes.get(path, -1e9) < self.SELF_WRITE_GRACE:
                 continue  # our own save
             if path not in prev:
                 tree_touched = True
             self._handle_modified(path, now)
-            changed = True
+            changed_paths.append(path)
         for path in deleted:
             if now - self._self_writes.get(path, -1e9) < self.SELF_WRITE_GRACE:
                 continue  # our own revert (deleting an agent-added file)
             tree_touched = True
             self._handle_deleted(path, now)
-            changed = True
+            changed_paths.append(path)
         if tree_touched:
             self._refresh_tree()
-        if changed:
+        if changed_paths:
             self._emit_changes()
+            # A change landing in a collapsed folder must not hide itself.
+            for path in changed_paths:
+                self._expand_path_in_explorer(path)
 
     def _handle_modified(self, path: Path, now: float) -> None:
         new_text = self._read_text(path)
@@ -2327,6 +2338,74 @@ class AlxEditApp(App):
             if tag in ("replace", "insert"):
                 added += j2 - j1
         return added, removed
+
+    def _expand_path_in_explorer(self, path: Path) -> None:
+        """Expand any collapsed folder on *path*'s trail in the explorer.
+
+        A change landing inside a hidden folder would otherwise be easy to
+        miss — the marker is there, just out of sight. Schedules the async
+        walk (DirectoryTree loads children lazily, so it may need to wait
+        for loads).
+        """
+        try:
+            self.run_worker(
+                partial(self._expand_ancestors, path),
+                group="expand-path",
+                exit_on_error=False,  # best-effort UI sugar; never crash the app
+            )
+        except Exception:
+            pass  # no running loop (shutting down / pre-mount)
+
+    async def _expand_ancestors(self, path: Path) -> None:
+        """Expand collapsed explorer folders down to *path*'s parent.
+
+        The walk descends from the tree root, level by level: find the
+        child node, expand it, wait for its (lazy) contents to load, then
+        go on. Folders that are already expanded are left untouched.
+        """
+        try:
+            tree = self.query_one(Explorer)
+        except NoMatches:
+            return  # tree not mounted yet
+        root_data = tree.root.data
+        if root_data is None:
+            return
+        base = root_data.path
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            return
+        node = tree.root
+        current = base
+        for part in rel.parts[:-1]:  # directory levels only
+            current = current / part
+            child = self._find_tree_child(node, current)
+            if child is None:
+                # Children may not be loaded yet (lazy), or the listing
+                # may be stale (folder just created). Nudge it, retry once.
+                if node is tree.root:
+                    await tree.reload_node(node)
+                else:
+                    node.expand()  # kicks off the lazy load of its children
+                    await tree._add_to_load_queue(node)
+                    child = self._find_tree_child(node, current)
+                    if child is None:
+                        await tree.reload_node(node)
+            child = self._find_tree_child(node, current)
+            if child is None:
+                return  # not in the tree (dotfile, or no longer there)
+            if child.is_collapsed:
+                child.expand()  # also kicks off the lazy load below it
+            node = child
+        # *path*'s parent is expanded: the file (and its marker) is visible.
+
+    @staticmethod
+    def _find_tree_child(node, target: Path):
+        """The direct child of *node* whose path is *target*, if loaded."""
+        for child in node.children:
+            if child.data is not None and _same_file(child.data.path, target):
+                return child
+        return None
 
     def _refresh_tree(self) -> None:
         if self._tree_reload_pending:

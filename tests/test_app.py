@@ -840,6 +840,119 @@ async def test_tree_marker_repaints_without_interaction(repo: Path) -> None:
         assert "+1/-1" not in rendered()
 
 
+def _node_at(tree, path: Path):
+    """The tree node for *path*, walking from the root (if the trail loaded)."""
+    node = tree.root
+    base = tree.root.data.path
+    rel = path.relative_to(base)
+    for i in range(len(rel.parts)):
+        target = base.joinpath(*rel.parts[: i + 1])
+        node = next(
+            (
+                c
+                for c in node.children
+                if c.data is not None and c.data.path == target
+            ),
+            None,
+        )
+        if node is None:
+            return None
+    return node
+
+
+async def _wait_for(pilot, predicate, tries: int = 40) -> bool:
+    for _ in range(tries):
+        await pilot.pause()
+        if predicate():
+            return True
+    return predicate()
+
+
+async def test_change_in_collapsed_folder_expands_it(repo: Path) -> None:
+    """A change landing in a collapsed folder re-opens its trail.
+
+    The explorer hides collapsed folders, so a change inside one would be
+    invisible (marker and all) unless the trail expands on its own.
+    """
+    deep = repo / "nested" / "deep"
+    deep.mkdir(parents=True)
+    (deep / "notes.txt").write_text("line one\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        tree = app.query_one(Explorer)
+        assert await _wait_for(pilot, lambda: bool(tree.root.children))
+        nested = _node_at(tree, repo / "nested")
+        assert nested is not None
+
+        # open the trail once (loads the nodes), then collapse it
+        nested.expand()
+        assert await _wait_for(
+            pilot, lambda: _node_at(tree, repo / "nested" / "deep") is not None
+        )
+        deep_node = _node_at(tree, repo / "nested" / "deep")
+        deep_node.expand()
+        assert await _wait_for(
+            pilot,
+            lambda: _node_at(tree, repo / "nested" / "deep" / "notes.txt")
+            is not None,
+        )
+        nested.collapse()
+        deep_node.collapse()
+        await pilot.pause()
+        assert nested.is_collapsed and deep_node.is_collapsed
+
+        # an untouched collapsed folder stays collapsed
+        src = _node_at(tree, repo / "src")
+        assert src is not None and src.is_collapsed
+
+        # the agent edits the deep file
+        (deep / "notes.txt").write_text("line one\nline two\n")
+        app._watch_tick()
+        assert await _wait_for(pilot, lambda: nested.is_expanded)
+
+        # the trail re-opened so the changed file (and its marker) is visible
+        assert repo / "nested" / "deep" / "notes.txt" in app._changes
+        assert nested.is_expanded and deep_node.is_expanded
+        assert (
+            _node_at(tree, repo / "nested" / "deep" / "notes.txt") is not None
+        )
+        # and the quiet folder was left alone
+        assert src.is_collapsed
+
+
+async def test_change_in_never_expanded_folder_expands_it(repo: Path) -> None:
+    """A change in a folder the user never opened must still be revealed.
+
+    Its children were never lazy-loaded, so the walk has to load each level
+    as it goes.
+    """
+    hidden = repo / "vault" / "secrets"
+    hidden.mkdir(parents=True)
+    (hidden / "pass.txt").write_text("hunter2\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        tree = app.query_one(Explorer)
+        assert await _wait_for(pilot, lambda: bool(tree.root.children))
+        vault = _node_at(tree, repo / "vault")
+        assert vault is not None
+        assert vault.is_collapsed
+        # never expanded: the secret folder was never even loaded
+        assert _node_at(tree, repo / "vault" / "secrets") is None
+
+        (hidden / "pass.txt").write_text("hunter3\n")
+        app._watch_tick()
+        assert await _wait_for(
+            pilot,
+            lambda: _node_at(tree, repo / "vault" / "secrets" / "pass.txt")
+            is not None,
+        )
+
+        assert repo / "vault" / "secrets" / "pass.txt" in app._changes
+        assert vault.is_expanded
+        secrets = _node_at(tree, repo / "vault" / "secrets")
+        assert secrets is not None and secrets.is_expanded
+
+
 async def test_own_save_is_not_flagged_as_external(repo: Path) -> None:
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(100, 30)) as pilot:
