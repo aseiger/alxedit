@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from textual.widgets import TabPane, TabbedContent
+from textual.widgets import Button, ListView, TabPane, TabbedContent, TextArea
 
+from alxedit2 import sessions
 from alxedit2.__main__ import resolve_root
-from alxedit2.app import AlxEditApp, Explorer
+from alxedit2.app import AlxEditApp, Explorer, SessionScreen
 from alxedit2.languages import language_for_path
 
 
@@ -115,6 +116,268 @@ async def test_edit_marks_dirty_then_saves(repo: Path) -> None:
         await pilot.pause()
         assert not buf.modified
         assert (repo / "app.js").read_text() == "const a = 2;\n"
+
+
+async def test_opening_changed_file_goes_straight_to_diff(repo: Path) -> None:
+    from alxedit2.app import HunkBar
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        # the agent edits a file that is not open
+        (repo / "app.js").write_text("const a = 999;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert (repo / "app.js") in app._changes
+
+        # opening it now goes directly into the diff review
+        area = await app.open_path(repo / "app.js")
+        await pilot.pause()
+        assert area in app._inline_diff
+        assert app.query_one(HunkBar).display
+        # the view holds the agent's content (green) + the session baseline
+        assert "999" in area.text
+
+
+async def test_resolve_theirs_after_open_commits_to_baseline(repo: Path) -> None:
+    """Agent edits a closed file; user opens it and resolves the hunk to
+    'theirs'. Approving is a commit: the resolved content becomes the session
+    baseline (mirror) immediately — the dot clears, the change settles out of
+    the pending list, and the async TextArea.Changed that follows must not
+    re-dirty the buffer.
+    """
+    (repo / "app.js").write_text("const a = 1;\n")
+    app = AlxEditApp(root=repo)  # app.js NOT pre-opened
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        # Agent edits while the file is closed.
+        (repo / "app.js").write_text("const a = 42;\n")
+        app._watch_tick()
+        await pilot.pause()
+        # Opening it goes straight to the inline diff.
+        area = await app.open_path(repo / "app.js")
+        await pilot.pause()
+        buf = app.buffers[area]
+        assert area in app._inline_diff
+        assert buf.saved_text == "const a = 42;\n"
+        state = app._inline_diff[area]
+        assert len(state.hunks) >= 1
+        # Resolve every hunk to 'theirs' (accept the agent's text).
+        for i in range(len(state.hunks)):
+            app._on_hunk_button(f"hunk-{i}-theirs")
+            await pilot.pause()
+        # Approving is a commit: dot clears, change settles, baseline updated.
+        assert area not in app._inline_diff
+        assert buf.modified is False
+        assert (repo / "app.js") not in app._changes
+        assert app._baseline_text(repo / "app.js") == "const a = 42;\n"
+        from textual.widgets._tabbed_content import ContentTabs
+
+        pane = app._panes[area]
+        tabs = app._tabbed.get_child_by_type(ContentTabs)
+        assert "●" not in str(tabs.get_content_tab(pane.id).label)
+
+
+async def test_resolving_all_hunks_settles_pending_change(repo: Path) -> None:
+    """Accepting every hunk of an external change settles it out of the
+    pending list (like F2 Approve). Left there it would linger, and re-opening
+    the diff for it would show a blank view (buffer already equals the disk
+    side it was diffed against).
+    """
+    (repo / "app.js").write_text("const a = 1;\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        (repo / "app.js").write_text("const a = 42;\n")  # agent edits
+        app._watch_tick()
+        await pilot.pause()
+        assert (repo / "app.js") in app._changes
+
+        area = await app.open_path(repo / "app.js")
+        await pilot.pause()
+        state = app._inline_diff[area]
+        assert len(state.hunks) >= 1
+        for i in range(len(state.hunks)):
+            app._on_hunk_button(f"hunk-{i}-theirs")
+            await pilot.pause()
+
+        # Settled: no longer a pending external change; the resolved content
+        # is now the session baseline, so the dot clears.
+        assert (repo / "app.js") not in app._changes
+        assert app.buffers[area].modified is False
+        assert app._baseline_text(repo / "app.js") == "const a = 42;\n"
+        # ...and it does not reappear on the next watcher pass (the disk has
+        # not changed since the change was first detected).
+        app._watch_tick()
+        await pilot.pause()
+        assert (repo / "app.js") not in app._changes
+        # Re-requesting the diff no longer drops into a (blank) inline view.
+        await app.show_inline_diff(repo / "app.js")
+        await pilot.pause()
+        assert area not in app._inline_diff
+
+
+# --------------------------------------------------------------------------- #
+# sessions (.alxedit/<sid>/ mirror = diff baseline)
+# --------------------------------------------------------------------------- #
+
+
+def test_sessions_module_create_list_delete(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("one\n")
+    (tmp_path / ".secret").write_text("hidden\n")
+
+    s1 = sessions.create_session(tmp_path, "first")
+    s2 = sessions.create_session(tmp_path, "second")
+    for f in sessions.iter_tracked_files(tmp_path):
+        sessions.copy_to_mirror(tmp_path, s1, f)
+        sessions.copy_to_mirror(tmp_path, s2, f)
+
+    found = sessions.list_sessions(tmp_path)
+    assert [s.id for s in found] == [s2, s1]  # newest first
+    assert found[1].label == "first"
+    assert found[1].file_count == 1
+    assert sessions.read_mirror_text(tmp_path, s1, tmp_path / "a.txt") == "one\n"
+
+    # the session dir refuses to mirror itself
+    with pytest.raises(ValueError):
+        sessions.mirror_path(tmp_path, s1, tmp_path / ".alxedit" / s1 / "x")
+
+    sessions.delete_session(tmp_path, s1)
+    assert [s.id for s in sessions.list_sessions(tmp_path)] == [s2]
+
+
+async def test_startup_creates_session_with_mirror(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert app.session_id is not None
+        sdir = repo / ".alxedit" / app.session_id
+        assert (sdir / "session.json").is_file()
+        assert (
+            sdir / "files" / "src" / "hello.py"
+        ).read_text() == "def hello():\n    return 'world'\n"
+        assert (sdir / "files" / "app.js").read_text() == "const a = 1;\n"
+        # dotfiles are not mirrored
+        assert not (sdir / "files" / ".hidden").exists()
+
+
+async def test_save_updates_session_mirror(repo: Path) -> None:
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        area.load_text("const a = 42;\n")
+        app.action_save()
+        await pilot.pause()
+        mirror = repo / ".alxedit" / app.session_id / "files" / "app.js"
+        assert mirror.read_text() == "const a = 42;\n"
+
+
+def _select_session(screen: SessionScreen, sid: str) -> None:
+    """Point the picker's cursor at the session with id *sid*."""
+    lv = screen.query_one("#session-list", ListView)
+    lv.index = [s.id for s in screen._sessions].index(sid)
+
+
+async def test_picker_opens_existing_session(repo: Path) -> None:
+    s1 = sessions.create_session(repo, "first")
+    s2 = sessions.create_session(repo, "second")
+    for f in sessions.iter_tracked_files(repo):
+        sessions.copy_to_mirror(repo, s1, f)
+        sessions.copy_to_mirror(repo, s2, f)
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        # the picker comes up on top with both sessions
+        assert isinstance(app.screen, SessionScreen)
+        assert len(app.screen._sessions) == 2
+        _select_session(app.screen, s1)
+        app.screen.query_one("#sess-open", Button).press()
+        await pilot.pause()
+        assert app.session_id == s1
+
+
+async def test_picker_new_session_and_delete(repo: Path) -> None:
+    s1 = sessions.create_session(repo, "first")
+    s2 = sessions.create_session(repo, "second")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        screen = app.screen
+
+        # delete s1: navigate to it, then press Delete twice to confirm
+        _select_session(screen, s1)
+        screen.query_one("#sess-delete", Button).press()
+        screen.query_one("#sess-delete", Button).press()
+        await pilot.pause()
+        assert not (repo / ".alxedit" / s1).exists()
+        assert (repo / ".alxedit" / s2).is_dir()
+
+        # create a new session from the picker
+        screen.query_one("#sess-new", Button).press()
+        await pilot.pause()
+        assert app.session_id not in (s1, s2)
+        sdir = repo / ".alxedit" / app.session_id
+        assert (sdir / "files" / "app.js").read_text() == "const a = 1;\n"
+
+
+async def test_session_switch_changes_baseline(repo: Path) -> None:
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        s1 = app.session_id
+
+        # agent edits outside
+        (repo / "app.js").write_text("const a = 999;\n")
+        app._watch_tick()
+        await pilot.pause()
+        rec = app._changes[repo / "app.js"]
+        assert rec.baseline_text == "const a = 1;\n"  # session-1 baseline
+
+        # adopt it (esc), so the tree holds 999
+        await pilot.press("escape")
+        await pilot.pause()
+        assert (repo / "app.js").read_text() == "const a = 999;\n"
+
+        # new session: baseline is now the 999 content
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        app.screen.query_one("#sess-new", Button).press()
+        await pilot.pause()
+        s2 = app.session_id
+        assert s2 != s1
+        assert (repo / ".alxedit" / s2 / "files" / "app.js").read_text() == (
+            "const a = 999;\n"
+        )
+        assert app._changes == {}
+
+        # agent edits again: the diff is against session 2's baseline
+        (repo / "app.js").write_text("const a = 1000;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert app._changes[repo / "app.js"].baseline_text == "const a = 999;\n"
+
+
+async def test_cannot_delete_active_session(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        active = app.session_id
+
+        app.action_sessions()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SessionScreen)
+        screen.query_one("#sess-delete", Button).press()
+        screen.query_one("#sess-delete", Button).press()
+        await pilot.pause()
+        assert (repo / ".alxedit" / active).is_dir()
+        screen.query_one("#sess-cancel", Button).press()
+        await pilot.pause()
+        assert app.session_id == active
 
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +507,339 @@ async def test_deleted_file_is_tracked_and_revert_restores_it(repo: Path) -> Non
         assert target.read_text() == original
 
 
+async def test_approve_new_file_adopts_it(repo: Path) -> None:
+    """Approve an 'added' file: it stays on disk and the mirror adopts it."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        agent_file = repo / "agent_notes.txt"
+        agent_file.write_text("agent wrote this\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert app._changes[agent_file].status == "added"
+
+        app.approve_path(agent_file)
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+
+        assert agent_file.exists()
+        assert agent_file not in app._changes
+        # Approve marks the change as pending; the baseline (mirror) is
+        # only updated on save.
+        assert not sessions.mirror_exists(repo, app.session_id, agent_file)
+
+        # Saving commits the change to the baseline.
+        area = await app.open_path(agent_file)
+        await pilot.pause()
+        buf = app.buffers[area]
+        assert buf.modified  # dot: buffer differs from baseline
+        app.action_save()
+        await pilot.pause()
+        assert sessions.mirror_exists(repo, app.session_id, agent_file)
+        assert (
+            sessions.read_mirror_text(repo, app.session_id, agent_file)
+            == "agent wrote this\n"
+        )
+        assert not buf.modified  # dot cleared after save
+
+
+async def test_approve_deleted_file_drops_mirror(repo: Path) -> None:
+    """Approve a 'deleted' file: it stays gone and the mirror copy is dropped."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        target = repo / "README.md"
+        target.unlink()
+        app._watch_tick()
+        await pilot.pause()
+        assert app._changes[target].status == "deleted"
+
+        app.approve_path(target)
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+
+        assert not target.exists()
+        assert target not in app._changes
+        assert not sessions.mirror_exists(repo, app.session_id, target)
+
+
+async def test_approve_modified_file_marks_pending(repo: Path) -> None:
+    """Approve a 'modified' file: buffer updated, dot shown, baseline unchanged until save."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        target = repo / "app.js"
+        original = target.read_text()
+        target.write_text("const a = 42;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert app._changes[target].status == "modified"
+
+        app.approve_path(target)
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+
+        assert target.read_text() == "const a = 42;\n"
+        assert target not in app._changes
+        # Approve does NOT update the mirror — it stays at the original.
+        assert sessions.read_mirror_text(repo, app.session_id, target) == original
+
+        # Open the file: the dot shows because buffer != baseline.
+        area = await app.open_path(target)
+        await pilot.pause()
+        buf = app.buffers[area]
+        assert area.text == "const a = 42;\n"
+        assert buf.modified  # pending: differs from baseline
+
+        # Save commits: mirror updated, dot cleared.
+        app.action_save()
+        await pilot.pause()
+        assert (
+            sessions.read_mirror_text(repo, app.session_id, target)
+            == "const a = 42;\n"
+        )
+        assert not buf.modified
+
+
+async def test_reject_modified_file_restores_baseline(repo: Path) -> None:
+    """Reject a 'modified' file (via the confirmed Reject path): restored."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        target = repo / "app.js"
+        original = target.read_text()
+        target.write_text("const a = 42;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert app._changes[target].status == "modified"
+
+        app.reject_path(target)
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+
+        assert target.read_text() == original
+        assert target not in app._changes
+
+
+async def test_reject_cancel_keeps_change(repo: Path) -> None:
+    """Declining the Reject confirm leaves the change tracked and on disk."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        target = repo / "app.js"
+        target.write_text("const a = 42;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert app._changes[target].status == "modified"
+
+        app.reject_path(target)
+        await pilot.pause()
+        app.screen.query_one("#cancel", Button).press()
+        await pilot.pause()
+
+        assert target.read_text() == "const a = 42;\n"
+        assert target in app._changes
+
+
+async def test_approve_all(repo: Path) -> None:
+    """Approve all: every tracked change is adopted at once."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        new_file = repo / "new.txt"
+        new_file.write_text("one\n")
+        (repo / "app.js").write_text("const a = 42;\n")
+        (repo / "README.md").unlink()
+        app._watch_tick()
+        await pilot.pause()
+        assert len(app._changes) == 3
+
+        app.approve_all()
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+
+        assert app._changes == {}
+        assert new_file.exists()
+        assert (repo / "app.js").read_text() == "const a = 42;\n"
+        assert not (repo / "README.md").exists()
+        assert not sessions.mirror_exists(repo, app.session_id, repo / "README.md")
+
+
+async def test_reject_all(repo: Path) -> None:
+    """Reject all: additions removed, edits + deletions restored."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        new_file = repo / "new.txt"
+        new_file.write_text("one\n")
+        appjs = repo / "app.js"
+        original_js = appjs.read_text()
+        readme = repo / "README.md"
+        original_readme = readme.read_text()
+        appjs.write_text("const a = 42;\n")
+        readme.unlink()
+        app._watch_tick()
+        await pilot.pause()
+        assert len(app._changes) == 3
+
+        app.reject_all()
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+
+        assert app._changes == {}
+        assert not new_file.exists()
+        assert appjs.read_text() == original_js
+        assert readme.read_text() == original_readme
+
+
+async def test_changes_screen_shows_approve_reject_buttons(repo: Path) -> None:
+    """The F2 window exposes Approve / Reject (and the all-variants)."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        (repo / "agent.txt").write_text("hi\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        app.action_changes()
+        await pilot.pause()
+        screen = app.screen
+        for button_id in ("btn-approve", "btn-reject", "btn-approve-all", "btn-reject-all"):
+            assert screen.query_one(f"#{button_id}", Button)
+
+
+async def test_changes_button_highlights_while_pending(repo: Path) -> None:
+    """The top-bar Changes button is highlighted while the session has
+    pending changes, and returns to normal once they are all resolved.
+    """
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        btn = app.query_one("#btn-changes", Button)
+        assert not btn.has_class("has-changes")
+
+        # An external edit appears -> the button lights up.
+        (repo / "app.js").write_text("const a = 42;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert btn.has_class("has-changes")
+
+        # Resolving the change clears the highlight again.
+        app.reject_all()
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        await pilot.pause()
+        assert not btn.has_class("has-changes")
+
+
+async def test_save_resolving_change_clears_changes_button(repo: Path) -> None:
+    """Saving an open file that has a pending external change resolves it, so
+    the Changes button must clear (not just the reject/approve paths).
+    """
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        btn = app.query_one("#btn-changes", Button)
+        assert not btn.has_class("has-changes")
+
+        # Agent edits the already-open file -> pending change, button lights up.
+        (repo / "app.js").write_text("const a = 42;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert btn.has_class("has-changes")
+
+        # Saving adopts the change -> resolved -> button clears again.
+        app.action_save()
+        await pilot.pause()
+        assert app._changes == {}
+        assert not btn.has_class("has-changes")
+        assert (repo / "app.js").read_text() == "const a = 42;\n"
+
+
+async def test_explorer_shows_plus_minus_markers(repo: Path) -> None:
+    from rich.style import Style
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        target = repo / "app.js"  # "const a = 1;" — one line
+
+        # agent rewrites the one line into three: +3 / -1 (like git diffstat)
+        target.write_text("const a = 9;\nconst b = 2;\nconst c = 3;\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        # marker counts are computed against the session copy
+        assert app._tree_markers.get(target) == (3, 1)
+
+        # and they show up in the tree node label
+        tree = app.query_one(Explorer)
+        node = next(n for n in tree.root.children if n.data.path == target)
+        label = tree.render_label(node, Style(), Style())
+        assert "+3" in label.plain
+        assert "-1" in label.plain
+
+        # a file matching the session copy has no marker
+        quiet = next(n for n in tree.root.children if n.data.path == (repo / "README.md"))
+        assert "+" not in tree.render_label(quiet, Style(), Style()).plain
+
+        # after revert, the file matches the session copy again -> marker gone
+        app.revert_path(target)
+        await pilot.pause()
+        assert target not in app._tree_markers
+
+
+async def test_tree_marker_repaints_without_interaction(repo: Path) -> None:
+    """The marker appears in the *rendered* tree right after an external edit.
+
+    Regression: Tree caches its rendered lines, so a plain refresh() repainted
+    the stale label and the marker only showed up after clicking the panel.
+    Uses a depth-2 file so the score must also survive the guide truncation.
+    """
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        # wait for the async directory loader
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            if ex.root is not None and ex.root.children:
+                break
+        ex.root.children[0].expand()  # open "src/"
+        for _ in range(20):
+            await pilot.pause()
+            if any(
+                c.data and c.data.path.name == "hello.py"
+                for c in ex.root.children[0].children
+            ):
+                break
+
+        def rendered() -> str:
+            strips = app.screen._compositor.render_strips(app.screen.size)
+            return "\n".join(s.text for s in strips)
+
+        assert "+1/-1" not in rendered()
+
+        (repo / "src/hello.py").write_text("def hello():\n    return 'changed'\n")
+        app._watch_tick()
+        for _ in range(10):
+            await pilot.pause()
+
+        assert "+1/-1" in rendered(), "marker must paint without any click"
+
+        # revert -> the score vanishes from the rendered tree too
+        (repo / "src/hello.py").write_text("def hello():\n    return 'world'\n")
+        app._watch_tick()
+        for _ in range(10):
+            await pilot.pause()
+        assert "+1/-1" not in rendered()
+
+
 async def test_own_save_is_not_flagged_as_external(repo: Path) -> None:
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(100, 30)) as pilot:
@@ -302,8 +898,26 @@ async def test_inline_diff_in_editor_and_esc_restores(repo: Path) -> None:
         assert not area.is_read_only
         assert area.text == "const a = 999;\n"  # clean buffer adopted disk
 
-        # adopting the change approves it — nothing left to diff
+        # abandoning the review is NOT a decision: the change stays
+        # pending in the ledger and the session mirror is untouched
+        assert repo / "app.js" in app._changes
+        assert (
+            sessions.read_mirror_text(repo, app.session_id, repo / "app.js")
+            == "const a = 1;\n"
+        )
+        # the adopted text is uncommitted, so the dot rides along
+        assert app.buffers[area].modified
+
+        # saving now commits the adopted content to the baseline
+        app.action_save()
+        await pilot.pause()
+        assert (
+            sessions.read_mirror_text(repo, app.session_id, repo / "app.js")
+            == "const a = 999;\n"
+        )
         assert repo / "app.js" not in app._changes
+        assert not app.buffers[area].modified
+
         app.action_toggle_diff()
         await pilot.pause()
         assert area not in app._inline_diff
@@ -365,6 +979,85 @@ async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
         app.action_save()
         await pilot.pause()
         assert (repo / "app.js").read_text() == "one\nTWO\nthree\n"
+
+
+async def test_hunk_all_mine_clean_buffer_no_dot(repo: Path) -> None:
+    """Resolve every hunk to 'mine' (original text): buffer matches the
+    session baseline (mirror) → no unsaved dot. Saving reverts the disk.
+    """
+    (repo / "app.js").write_text("one\ntwo\nthree\n")
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        (repo / "app.js").write_text("one\nTWO\nthree\nfour\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        state = app._inline_diff[area]
+        assert len(state.hunks) == 2
+
+        # Resolve both hunks to 'mine', keeping the original lines.
+        app._on_hunk_button("hunk-0-mine")
+        await pilot.pause()
+        app._on_hunk_button("hunk-1-mine")
+        await pilot.pause()
+
+        assert area not in app._inline_diff
+        assert area.text == "one\ntwo\nthree\n"
+        # Buffer matches the session baseline (mirror) → no dot.
+        assert app.buffers[area].modified is False
+        from textual.widgets._tabbed_content import ContentTabs
+
+        pane = app._panes[area]
+        tabs = app._tabbed.get_child_by_type(ContentTabs)
+        assert "●" not in str(tabs.get_content_tab(pane.id).label)
+
+        # Saving reverts the disk back to the baseline content.
+        app.action_save()
+        await pilot.pause()
+        assert (repo / "app.js").read_text() == "one\ntwo\nthree\n"
+        assert app.buffers[area].modified is False
+
+
+async def test_hunk_all_theirs_commits_to_baseline(repo: Path) -> None:
+    """Resolving every hunk to 'theirs' (accepting the agent's text) commits
+    immediately: the resolved content becomes the session baseline (mirror),
+    the dot clears, and the change settles out of the pending list."""
+    (repo / "app.js").write_text("one\ntwo\nthree\n")
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        (repo / "app.js").write_text("one\nTWO\nthree\nfour\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        state = app._inline_diff[area]
+        assert len(state.hunks) == 2
+
+        # Resolve both hunks to 'theirs', accepting the agent's lines.
+        app._on_hunk_button("hunk-0-theirs")
+        await pilot.pause()
+        app._on_hunk_button("hunk-1-theirs")
+        await pilot.pause()
+
+        assert area not in app._inline_diff
+        assert area.text == "one\nTWO\nthree\nfour\n"
+        # Approving is a commit: dot clears, change settles, baseline updated.
+        assert app.buffers[area].modified is False
+        assert (repo / "app.js") not in app._changes
+        assert app._baseline_text(repo / "app.js") == "one\nTWO\nthree\nfour\n"
+        from textual.widgets._tabbed_content import ContentTabs
+
+        pane = app._panes[area]
+        tabs = app._tabbed.get_child_by_type(ContentTabs)
+        assert "●" not in str(tabs.get_content_tab(pane.id).label)
+        # Disk already matches (agent wrote it); a save is now a no-op.
+        app.action_save()
+        await pilot.pause()
+        assert (repo / "app.js").read_text() == "one\nTWO\nthree\nfour\n"
+        assert app.buffers[area].modified is False
 
 
 async def test_hunk_mine_keeps_dirty_edits(repo: Path) -> None:
@@ -456,3 +1149,289 @@ async def test_changes_screen_lists_tracked_changes(repo: Path) -> None:
         await pilot.pause()
         lv = app.screen.query_one("#changes-list", ListView)
         assert len(list(lv.query(ListItem))) == 2
+
+
+async def test_restart_flags_files_that_differ_from_mirror(repo: Path) -> None:
+    """Files edited while alxedit2 was closed are flagged on re-activation:
+    markers, F2 list and counter all track "differs from the session copy".
+    """
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        sid = app.session_id
+
+        # the agent works while the app is "closed"
+        (repo / "app.js").write_text("const a = 2;\nconst b = 3;\n")
+        (repo / "brandnew.txt").write_text("one\ntwo\nthree\n")
+        (repo / "src" / "hello.py").unlink()
+
+        # re-open the same session (simulates a restart)
+        app._activate_session(sid)
+        await pilot.pause()
+
+        recs = {p.name: r for p, r in app._changes.items()}
+        assert recs["app.js"].status == "modified"
+        assert recs["brandnew.txt"].status == "added"
+        assert recs["hello.py"].status == "deleted"
+
+        assert app._tree_markers[repo / "app.js"] == (2, 1)
+        assert app._tree_markers[repo / "brandnew.txt"] == (3, 0)
+        assert app._tree_markers[repo / "src" / "hello.py"] == (0, 2)
+        assert repo / "README.md" not in app._tree_markers
+
+
+async def test_restart_clean_tree_flags_nothing(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app._activate_session(app.session_id)
+        await pilot.pause()
+        assert app._changes == {}
+        assert app._tree_markers == {}
+
+
+async def test_tab_shows_unsaved_marker(repo: Path) -> None:
+    """The tab label carries a ● while the buffer is dirty, gone after save."""
+    from textual.widgets._tabbed_content import ContentTabs
+
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        tabs = app._tabbed.get_child_by_type(ContentTabs)
+        tab = tabs.get_content_tab(app._panes[area].id)
+        assert "●" not in str(tab.label)
+
+        await pilot.press("end", "x")
+        await pilot.pause()
+        assert "●" in str(tab.label)
+
+        app.action_save()
+        await pilot.pause()
+        assert "●" not in str(tab.label)
+        assert (repo / "app.js").read_text().endswith("x\n")
+
+
+async def test_new_folder_creates_directory(repo: Path) -> None:
+    """ctrl+shift+n creates a folder where the cursor is; tree picks it up."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            if ex.root is not None and ex.root.children:
+                break
+        await pilot.press("ctrl+shift+n")
+        await pilot.pause()
+        await pilot.press(*list("stuff and such"))
+        await pilot.press("enter")
+        names = []
+        for _ in range(20):
+            await pilot.pause()
+            names = [c.data.path.name for c in ex.root.children if c.data]
+            if "stuff and such" in names:
+                break
+        assert (repo / "stuff and such").is_dir()
+        assert "stuff and such" in names
+
+
+async def test_delete_folder_removes_directory(repo: Path) -> None:
+    """ctrl+shift+x deletes the highlighted folder after confirmation, and
+    session-tracked files inside stay flagged as deleted (revertable)."""
+    victim = repo / "victim"
+    victim.mkdir()
+    inner = victim / "inner.txt"
+    inner.write_text("one\ntwo\n")
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            if ex.root is not None and any(
+                c.data and c.data.path.name == "victim"
+                for c in ex.root.children
+            ):
+                break
+        node = next(
+            c for c in ex.root.children if c.data.path.name == "victim"
+        )
+        ex.move_cursor(node)
+        await pilot.pause()
+
+        await pilot.press("ctrl+shift+x")
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+
+        for _ in range(20):
+            await pilot.pause()
+            if not victim.exists():
+                break
+        assert not victim.exists()
+        # inner file was session-tracked -> flagged deleted, revertable
+        assert inner in app._changes
+        assert app._changes[inner].status == "deleted"
+        # and the folder is gone from the tree listing
+        names = [c.data.path.name for c in ex.root.children if c.data]
+        assert "victim" not in names
+
+
+async def _ctrl_click_node(pilot, app: AlxEditApp, ex: Explorer, node) -> None:
+    region = ex._get_label_region(node._line)
+    await pilot.click(Explorer, offset=(region.x + 2, region.y), control=True)
+    await pilot.pause()
+
+
+async def test_ctrl_click_file_menu_renames(repo: Path) -> None:
+    """Ctrl+click a file -> Rename renames it on disk and in the tree."""
+    old = repo / "oldname.txt"
+    old.write_text("hello\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        ex = None
+        node = None
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            node = next(
+                (c for c in ex.root.children
+                 if c.data and c.data.path.name == "oldname.txt"),
+                None,
+            )
+            if node is not None:
+                break
+        assert node is not None
+
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-rename", Button).press()
+        await pilot.pause()
+        await pilot.press(*list("newname.txt"))
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause()
+            if not old.exists():
+                break
+        assert not old.exists()
+        assert (repo / "newname.txt").exists()
+        names = [c.data.path.name for c in ex.root.children if c.data]
+        assert "newname.txt" in names and "oldname.txt" not in names
+
+
+async def test_ctrl_click_file_new_file_here(repo: Path) -> None:
+    """Ctrl+click a file -> 'New file here' creates an empty file in that
+    directory, shows it in the tree, and opens it."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        ex = None
+        node = None
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            node = next(
+                (c for c in ex.root.children
+                 if c.data and c.data.path.name == "app.js"),
+                None,
+            )
+            if node is not None:
+                break
+        assert node is not None
+
+        await _ctrl_click_node(pilot, app, ex, node)
+        app.screen.query_one("#menu-new-file", Button).press()
+        await pilot.pause()
+        await pilot.press(*list("notes.txt"))
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause()
+            if (repo / "notes.txt").exists():
+                break
+        assert (repo / "notes.txt").exists()
+        names = [c.data.path.name for c in ex.root.children if c.data]
+        assert "notes.txt" in names
+
+
+async def test_ctrl_click_folder_delete(repo: Path) -> None:
+    """Ctrl+click a folder -> Delete (with confirm) removes it; tracked
+    files inside stay flagged deleted/revertable."""
+    victim = repo / "victim2"
+    victim.mkdir()
+    inner = victim / "inner.txt"
+    inner.write_text("one\ntwo\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        ex = None
+        node = None
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            node = next(
+                (c for c in ex.root.children
+                 if c.data and c.data.path.name == "victim2"),
+                None,
+            )
+            if node is not None:
+                break
+        assert node is not None
+
+        await _ctrl_click_node(pilot, app, ex, node)
+        app.screen.query_one("#menu-delete", Button).press()
+        await pilot.pause()
+        app.screen.query_one("#confirm", Button).press()
+        for _ in range(20):
+            await pilot.pause()
+            if not victim.exists():
+                break
+        assert not victim.exists()
+        assert inner in app._changes
+        assert app._changes[inner].status == "deleted"
+        names = [c.data.path.name for c in ex.root.children if c.data]
+        assert "victim2" not in names
+
+
+async def test_ctrl_click_folder_new_folder_here(repo: Path) -> None:
+    """Ctrl+click a folder -> 'New folder here' creates it inside."""
+    outer = repo / "outer"
+    outer.mkdir()
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        ex = None
+        node = None
+        for _ in range(40):
+            await pilot.pause()
+            ex = app.query_one(Explorer)
+            node = next(
+                (c for c in ex.root.children
+                 if c.data and c.data.path.name == "outer"),
+                None,
+            )
+            if node is not None:
+                break
+        assert node is not None
+
+        await _ctrl_click_node(pilot, app, ex, node)
+        app.screen.query_one("#menu-new-folder", Button).press()
+        await pilot.pause()
+        await pilot.press(*list("inner"))
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause()
+            if (outer / "inner").is_dir():
+                break
+        assert (outer / "inner").is_dir()
+
+
+async def test_help_mentions_unsaved_dot_after_resolution(repo: Path) -> None:
+    """F1 help explains the unsaved dot shown once a review is resolved."""
+    from textual.widgets import Static
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.press("f1")
+        await pilot.pause()
+        screen = app.screen
+        assert screen.__class__.__name__ == "HelpScreen"
+        joined = "\n".join(str(s.content) for s in screen.query(Static))
+        assert "all decided → editable again" in joined
+        assert "● tab = change not in baseline yet" in joined
+        assert "ctrl+s commits it" in joined

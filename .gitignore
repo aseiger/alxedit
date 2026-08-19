@@ -8,3 +8,10 @@ dist/
 # Environments & tooling
 .venv/
 .pytest_cache/
+
+# alxedit2 session snapshots (created at runtime in the working dir)
+.alxedit/
+
+# scratch files used to test the editor
+testfile.txt
+testfolder/
