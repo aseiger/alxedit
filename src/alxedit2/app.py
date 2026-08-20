@@ -49,23 +49,36 @@ from .languages import language_for_path
 # inline diff theme (colored +/− lines inside the editor)
 # --------------------------------------------------------------------------- #
 
-#: TextArea theme that maps our diff highlight names to colors. No tree-sitter
-#: grammar is involved — we fill the highlight map ourselves.
-_DIFF_THEME = TextAreaTheme(
-    "alxdiff",
-    syntax_styles={
-        "diff_add": Style(color="green"),
-        "diff_del": Style(color="red", strike=True),
-        "diff_mod": Style(color="yellow"),
-        "diff_modold": Style(color="yellow", strike=True),
-        # The change block most recently jumped to ("shown") gets a
-        # background; cleared as soon as the user scrolls the editor.
-        "diff_add_cur": Style(color="green", bgcolor="#33335f"),
-        "diff_del_cur": Style(color="red", strike=True, bgcolor="#33335f"),
-        "diff_mod_cur": Style(color="yellow", bgcolor="#33335f"),
-        "diff_modold_cur": Style(color="yellow", strike=True, bgcolor="#33335f"),
-    },
-)
+#: Highlight styles for the inline diff view (see :func:`render_blocks`).
+#: Line styles only set a *background* (plus strike for removed/old lines) so
+#: the file's own syntax highlighting still reads through; the marker
+#: character at column 0 (``+`` / ``⌫`` / ``M``) carries the strong per-kind
+#: color. The ``*_cur`` variants mark the hunk most recently jumped to
+#: ("shown") and are cleared as soon as the user scrolls the editor.
+_DIFF_STYLES: dict[str, Style] = {
+    "diff_add": Style(bgcolor="#153122"),
+    "diff_del": Style(bgcolor="#3b1a1a", strike=True),
+    "diff_mod": Style(bgcolor="#3a3312"),
+    "diff_modold": Style(bgcolor="#3a3312", strike=True),
+    "diff_add_cur": Style(bgcolor="#1a4a2e"),
+    "diff_del_cur": Style(bgcolor="#5c2424", strike=True),
+    "diff_mod_cur": Style(bgcolor="#4a4218"),
+    "diff_modold_cur": Style(bgcolor="#4a4218", strike=True),
+    "diff_mark_add": Style(color="#4ec97a", bold=True),
+    "diff_mark_del": Style(color="#e06c75", bold=True),
+    "diff_mark_mod": Style(color="#e5c07b", bold=True),
+}
+
+
+def _diff_theme(base: TextAreaTheme) -> TextAreaTheme:
+    """The ``alxdiff`` theme: *base* token styles + our diff line styles.
+
+    Built on each diff entry so the active theme's syntax highlighting
+    survives the review; the app restores the original theme on exit.
+    """
+    syntax = dict(base.syntax_styles or {})
+    syntax.update(_DIFF_STYLES)
+    return TextAreaTheme("alxdiff", syntax_styles=syntax)
 
 
 # --------------------------------------------------------------------------- #
@@ -1484,8 +1497,8 @@ class AlxEditApp(App):
                 await self.open_path(path)
             except (OSError, ValueError) as exc:
                 self.notify(str(exc), title="Open", severity="error")
-        if not self._panes:
-            await self.action_new_buffer()
+        # No default buffer: the tab area starts empty until the user
+        # creates a buffer (ctrl+n) or opens a file.
         area = self.active_area
         if area is not None:
             area.focus()
@@ -2128,12 +2141,13 @@ class AlxEditApp(App):
             # Remember the pre-diff state: loading the view below would
             # otherwise flag the buffer as modified.
             buf.clean_at_diff = clean_before
-        # No grammar (language=None) so Textual's own highlighter stays out of
-        # the way; we paint the diff lines ourselves below.
-        area.language = None
-        self._rerender(area, state)
-        area.register_theme(_DIFF_THEME)
+        # Syntax highlighting stays ON: the composite theme carries both the
+        # active theme's token styles and our diff styles (which only set a
+        # background, so the token colors show through). The original theme
+        # name was captured in the state and is restored on exit.
+        area.register_theme(_diff_theme(area._theme))
         area.theme = "alxdiff"
+        self._rerender(area, state)
         self._set_readonly(area, state)
         self._arm_scroll_watch(area)
         self._show_hunkbar(True)
@@ -2165,20 +2179,36 @@ class AlxEditApp(App):
         "modold": "diff_modold",
     }
 
+    #: diff line kind -> marker character (the :func:`render_blocks` prefix)
+    _KIND_MARKS: ClassVar[dict[str, str]] = {
+        "add": ADD_PREFIX,
+        "del": GHOST_PREFIX,
+        "mod": MOD_PREFIX,
+        "modold": MOD_PREFIX,
+    }
+
     @classmethod
     def _paint_inline_diff(
         cls, area: TextArea, state: InlineDiffState, kinds: list[str]
     ) -> None:
         """Paint the inline diff by line kind (see :func:`render_blocks`).
 
-        ``+`` green = addition, ``⌫`` red strike = deletion, ``M`` yellow =
+        Each diff line gets a background style — the file's syntax token
+        colors show through — plus a bold colored marker character.
+        ``+`` green = addition, ``⌫`` red strike = deletion, ``M`` =
         modified (old line struck, new line plain). Lines belonging to the
-        hunk most recently jumped to get a background (the ``*_cur``
-        variants), so the "just shown" change stays easy to spot until the
-        user scrolls away from it.
+        hunk most recently jumped to get a stronger background (the
+        ``*_cur`` variants), so the "just shown" change stays easy to spot
+        until the user scrolls away from it.
         """
         highlights = area._highlights
-        highlights.clear()
+        # Drop only our own spans: the grammar's token spans live in the very
+        # same map (and are rebuilt on every load_text) and must survive.
+        diff_names = set(_DIFF_STYLES)
+        for line in list(highlights):
+            spans = highlights[line]
+            if any(name in diff_names for _, _, name in spans):
+                highlights[line] = [span for span in spans if span[2] not in diff_names]
         cur = None
         if state.current_hunk is not None:
             start, count = _hunk_span(state, state.current_hunk)
@@ -2189,6 +2219,13 @@ class AlxEditApp(App):
                 continue
             name = base + "_cur" if (cur is not None and index in cur) else base
             highlights[index].append((0, None, name))
+            # Marker span: offsets are bytes (tree-sitter convention), and the
+            # marker is the first character of the line ("⌫" is 3 bytes).
+            mark = cls._KIND_MARKS[kind]
+            mark_kind = "mod" if kind == "modold" else kind
+            highlights[index].append(
+                (0, len(mark.encode("utf-8")), f"diff_mark_{mark_kind}")
+            )
 
     @staticmethod
     def _set_readonly(area: TextArea, state: InlineDiffState) -> None:

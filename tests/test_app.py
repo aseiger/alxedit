@@ -193,8 +193,22 @@ async def test_ide_layout_composes(repo: Path) -> None:
         assert tabs is not None
         # sidebar takes ~20% of the width
         assert 15 <= tree.region.width <= 25
-        # one untitled buffer by default
-        assert len(list(tabs.query(TabPane))) == 1
+        # no buffer by default — the tab area starts empty
+        assert len(list(tabs.query(TabPane))) == 0
+
+
+async def test_starts_empty_until_a_buffer_is_requested(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert app.active_area is None  # no untitled tab on startup
+
+        # ctrl+n creates the first buffer
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        area = app.active_area
+        assert area is not None
+        assert app._tabbed.active_pane is not None
 
 
 async def test_explorer_lists_repo_files(repo: Path) -> None:
@@ -222,7 +236,7 @@ async def test_open_file_sets_language(repo: Path) -> None:
         area2 = await app.open_path(repo / "src" / "hello.py")
         assert area2 is area
         tabs = app.query_one(TabbedContent)
-        assert len(list(tabs.query(TabPane))) == 2  # untitled + hello.py
+        assert len(list(tabs.query(TabPane))) == 1  # just hello.py
 
 
 async def test_edit_marks_dirty_then_saves(repo: Path) -> None:
@@ -1102,6 +1116,8 @@ async def test_new_file_saved_by_editor_appears_in_tree(repo: Path) -> None:
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
+        # no default buffer anymore — create one, like ctrl+n would
+        await app.action_new_buffer()
         area = app.active_area
         assert area is not None
 
@@ -1166,6 +1182,43 @@ async def test_inline_diff_in_editor_and_esc_restores(repo: Path) -> None:
         assert area not in app._inline_diff
 
 
+async def test_diff_view_keeps_syntax_highlighting(repo: Path) -> None:
+    """The review view must not kill the file's own syntax highlighting."""
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        assert area.language == "javascript"
+
+        (repo / "app.js").write_text("const a = 999;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert area in app._inline_diff
+
+        # the grammar stays on, and the active theme carries BOTH the
+        # token styles and the diff styles (composite "alxdiff" theme)
+        assert area.language == "javascript"
+        assert area.theme != "css"
+        syntax = area._theme.syntax_styles
+        assert "keyword" in syntax  # a grammar token style
+        assert "diff_modold" in syntax  # a diff line style
+
+        # on the "M const a = 1" line the grammar spans and our diff spans
+        # coexist: token colors show through the line background
+        spans = area._highlights[0]
+        names = {name for _, _, name in spans}
+        assert "keyword" in names  # "const", from the JS grammar
+        assert "diff_modold" in names  # our background + strike
+        assert (0, 1, "diff_mark_mod") in spans  # bold marker, 1 byte
+
+        # exit restores the original language + theme
+        await pilot.press("escape")
+        await pilot.pause()
+        assert area not in app._inline_diff
+        assert area.language == "javascript"
+        assert area.theme == "css"
+
+
 async def test_diff_kinds_rendered_distinctly(repo: Path) -> None:
     """+ green = addition, ⌫ red strike = deletion, M yellow = modified."""
     (repo / "kinds.txt").write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n")
@@ -1204,6 +1257,14 @@ async def test_diff_kinds_rendered_distinctly(repo: Path) -> None:
         assert style_of("M BETA") == "diff_mod"
         assert style_of("⌫ delta") == "diff_del"
         assert style_of("+ zeta") == "diff_add"
+
+        # each diff line also carries a bold marker on its first character
+        def mark_of(line: str) -> str:
+            return area._highlights[lines.index(line)][1][2]
+
+        assert mark_of("M beta") == "diff_mark_mod"
+        assert mark_of("⌫ delta") == "diff_mark_del"  # "⌫" is 3 bytes
+        assert mark_of("+ zeta") == "diff_mark_add"
 
 
 async def test_save_from_inline_diff_strips_ghost_lines(repo: Path) -> None:
