@@ -56,6 +56,10 @@ _DIFF_THEME = TextAreaTheme(
     syntax_styles={
         "diff_add": Style(color="green"),
         "diff_del": Style(color="red", strike=True),
+        # The change block most recently jumped to ("shown") gets a
+        # background; cleared as soon as the user scrolls the editor.
+        "diff_add_cur": Style(color="green", bgcolor="#33335f"),
+        "diff_del_cur": Style(color="red", strike=True, bgcolor="#33335f"),
     },
 )
 
@@ -161,6 +165,30 @@ def _hunk_take(state: "InlineDiffState", block: Hunk, take_theirs: bool) -> tupl
     return block.main if keep_main else block.ghost
 
 
+def _hunk_span(state: "InlineDiffState", index: int) -> tuple[int, int]:
+    """``(start line, line count)`` of the *index*-th hunk in the view.
+
+    Must agree with :func:`render_blocks` — the line count a block
+    contributes there is exactly the count used here.
+    """
+    line = 0
+    seen = 0
+    for block in state.blocks:
+        if not isinstance(block, Hunk):
+            line += len(block)
+            continue
+        if seen == index:
+            if block.decision is None:
+                return line, len(block.ghost) + len(block.main)
+            return line, len(_hunk_take(state, block, block.decision))
+        seen += 1
+        if block.decision is None:
+            line += len(block.ghost) + len(block.main)
+        else:
+            line += len(_hunk_take(state, block, block.decision))
+    return line, 0
+
+
 def render_blocks(state: "InlineDiffState") -> tuple[list[str], set[int], set[int]]:
     """Render the block model into view lines.
 
@@ -232,6 +260,10 @@ class InlineDiffState:
 
     blocks: list
     """File-ordered ``list[str]`` context blocks and :class:`Hunk``s."""
+
+    current_hunk: Optional[int] = None
+    """Index (into :attr:`hunks`) of the change block most recently jumped
+    to, or ``None``. Painted with a background until the user scrolls."""
 
     @property
     def hunks(self) -> list[Hunk]:
@@ -352,13 +384,66 @@ def display_path(path: Path) -> str:
         return path.as_posix()
 
 
+class PaneSizer(Static):
+    """Thin vertical handle that resizes the pane next to it.
+
+    ``pane_id`` names the pane (see ``AlxEditApp.PANE_SPECS``) and
+    ``side`` says which side of the handle the pane sits on:
+    ``"left"`` → dragging right widens it, ``"right"`` → dragging
+    left widens it. Keyboard shortcuts live on the app (``alt+←/→``
+    for the sidebar, ``alt+shift+←/→`` for the hunk panel).
+    """
+
+    DEFAULT_CSS = """
+    PaneSizer {
+        width: 1;
+        height: 100%;
+        background: $primary-background;
+    }
+    PaneSizer.resizing {
+        background: $accent;
+    }
+    """
+
+    def __init__(self, pane_id: str, side: str = "left", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.pane_id = pane_id
+        self.side = side
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        event.stop()
+        event.prevent_default()
+        self.app.begin_resize(self, self.pane_id, self.side, event)
+        self.add_class("resizing")
+
+    def end_resize(self) -> None:
+        self.remove_class("resizing")
+
+
+@dataclass(frozen=True)
+class ResizablePane:
+    """Spec for a pane that a :class:`PaneSizer` can resize.
+
+    ``unit`` is ``"pct"`` (percent of app width) or ``"cols"``;
+    ``mirrors`` are extra widgets that must track this pane's width
+    (e.g. the top-bar label above the sidebar).
+    """
+
+    selector: str
+    unit: str = "pct"
+    default: float = 24.0
+    minimum: float = 10.0
+    maximum: float = 60.0
+    step: float = 4.0
+    mirrors: tuple[str, ...] = ()
+
+
 class HunkBar(Vertical):
     """Right-hand panel: one accept/reject row per change block (hunk)."""
 
     DEFAULT_CSS = """
     HunkBar {
         width: 30;
-        border-left: solid $primary-background;
         background: $panel;
         padding: 0 1;
     }
@@ -378,8 +463,8 @@ class HunkBar(Vertical):
         height: 1;
         margin-bottom: 1;
     }
-    HunkBar .hunk-label {
-        width: 10;
+    HunkBar .hunk-jump {
+        width: 12;
         color: $text-muted;
         text-overflow: ellipsis;
     }
@@ -693,8 +778,14 @@ class HelpScreen(ModalScreen[None]):
             "              changes outside)\n"
             "              green = side a save keeps, ⌫ red = the other\n"
             "              right panel: 'theirs' (agent) / 'mine' (yours)\n"
-            "              per change block; all decided → editable again;\n"
+            "              per change block; click a block's number to jump\n"
+            "              to it; resolved hunks drop off the list;\n"
+            "              all decided → editable again;\n"
             "              ● tab = change not in baseline yet — ctrl+s commits it\n"
+            "alt+←/→       resize the sidebar (or drag the divider\n"
+            "              between explorer and editor)\n"
+            "alt+shift+←/→ resize the hunk panel (or drag its divider\n"
+            "              while a review is open)\n"
             "f1            this help\n"
             "\n"
             "mouse         click a file in the explorer to open it,\n"
@@ -1151,7 +1242,6 @@ class AlxEditApp(App):
     }
     #sidebar {
         width: 24%;
-        border-right: solid $primary-background;
     }
     #sidebar Explorer {
         width: 1fr;
@@ -1162,7 +1252,8 @@ class AlxEditApp(App):
         width: 1fr;
         height: 1fr;
     }
-    #hunkbar {
+    #hunkbar,
+    #hunk-sizer {
         display: none;
     }
     """
@@ -1177,7 +1268,34 @@ class AlxEditApp(App):
         Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
         Binding("f2", "changes", "Changes", show=False),
         Binding("f1", "help", "Help", show=False),
+        Binding("alt+left", "sidebar_left", "Narrow sidebar", show=False),
+        Binding("alt+right", "sidebar_right", "Widen sidebar", show=False),
+        Binding(
+            "alt+shift+left", "hunkbar_left", "Widen hunk panel", show=False
+        ),
+        Binding(
+            "alt+shift+right", "hunkbar_right", "Narrow hunk panel", show=False
+        ),
     ]
+
+    #: Resizable panes, by id. A :class:`PaneSizer` references one of these.
+    PANE_SPECS: ClassVar[dict[str, ResizablePane]] = {
+        "sidebar": ResizablePane(
+            selector="#sidebar",
+            unit="pct",
+            default=24.0,
+            minimum=10.0,
+            maximum=60.0,
+            mirrors=("#topbar .sidebar-label",),
+        ),
+        "hunkbar": ResizablePane(
+            selector="#hunkbar",
+            unit="cols",
+            default=30.0,
+            minimum=15.0,
+            maximum=60.0,
+        ),
+    }
 
     def __init__(
         self,
@@ -1212,6 +1330,18 @@ class AlxEditApp(App):
         #: approve). The one spurious TextArea.Changed that follows must not
         #: clobber ``modified`` — it is popped when that event is consumed.
         self._suppress_modified: set = set()
+        #: TextAreas already armed with the "clear current-hunk on scroll" watcher.
+        self._scroll_watched: set = set()
+        #: Current width per resizable pane (see PANE_SPECS), by pane id.
+        self._pane_values: dict[str, float] = {
+            pane_id: spec.default for pane_id, spec in self.PANE_SPECS.items()
+        }
+        #: Which sizer drag is in progress, if any.
+        self._resizing_sizer: Optional[PaneSizer] = None
+        self._resizing_pane: Optional[str] = None
+        self._resize_side: str = "left"
+        self._resize_start_x: float = 0.0
+        self._resize_start_value: float = 0.0
 
     # ------------------------------------------------------------------ #
     # layout
@@ -1228,10 +1358,85 @@ class AlxEditApp(App):
         with Horizontal(id="middle"):
             with Horizontal(id="sidebar"):
                 yield Explorer(self.root)
+            yield PaneSizer(pane_id="sidebar", side="left", id="sidebar-sizer")
             with Horizontal(id="tabs"):
                 yield TabbedContent(id="tabbed")
+            yield PaneSizer(pane_id="hunkbar", side="right", id="hunk-sizer")
             yield HunkBar(id="hunkbar")
         yield Statusbar()
+
+    # ------------------------------------------------------------------ #
+    # pane resizing (generic — see PANE_SPECS / PaneSizer / ResizablePane)
+    # ------------------------------------------------------------------ #
+
+    def pane_value(self, pane_id: str) -> float:
+        """Current width of a resizable pane (percent or columns)."""
+        return self._pane_values[pane_id]
+
+    def set_pane_value(self, pane_id: str, value: float) -> None:
+        """Clamp and apply a pane's width; assigning the style re-lays-out."""
+        spec = self.PANE_SPECS[pane_id]
+        value = max(spec.minimum, min(spec.maximum, float(value)))
+        self._pane_values[pane_id] = value
+        width = f"{value:.0f}%" if spec.unit == "pct" else f"{value:.0f}"
+        for selector in (spec.selector, *spec.mirrors):
+            for node in self.query(selector):
+                node.styles.width = width
+
+    def begin_resize(
+        self,
+        sizer: PaneSizer,
+        pane_id: str,
+        side: str,
+        event: events.MouseDown,
+    ) -> None:
+        """Record the drag start so MouseMove deltas are relative to it."""
+        self._resizing_sizer = sizer
+        self._resizing_pane = pane_id
+        self._resize_side = side
+        self._resize_start_x = event.screen_x
+        self._resize_start_value = self._pane_values[pane_id]
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        """While a sizer is held, follow the cursor and resize its pane."""
+        if self._resizing_pane is None:
+            return
+        spec = self.PANE_SPECS[self._resizing_pane]
+        delta_px = event.screen_x - self._resize_start_x
+        if spec.unit == "pct":
+            delta = delta_px * 100.0 / max(1, self.size.width)
+        else:
+            delta = float(delta_px)
+        new = (
+            self._resize_start_value + delta
+            if self._resize_side == "left"
+            else self._resize_start_value - delta
+        )
+        self.set_pane_value(self._resizing_pane, new)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        """Release the sizer drag from anywhere on screen."""
+        if self._resizing_sizer is not None:
+            self._resizing_sizer.end_resize()
+            self._resizing_sizer = None
+            self._resizing_pane = None
+
+    def _nudge_pane(self, pane_id: str, direction: int) -> None:
+        spec = self.PANE_SPECS[pane_id]
+        self.set_pane_value(pane_id, self._pane_values[pane_id] + spec.step * direction)
+
+    def action_sidebar_left(self) -> None:
+        self._nudge_pane("sidebar", -1)
+
+    def action_sidebar_right(self) -> None:
+        self._nudge_pane("sidebar", +1)
+
+    def action_hunkbar_left(self) -> None:
+        # pushing the divider left widens the hunk panel
+        self._nudge_pane("hunkbar", +1)
+
+    def action_hunkbar_right(self) -> None:
+        self._nudge_pane("hunkbar", -1)
 
     async def on_mount(self) -> None:
         self.set_interval(self.watch_interval, self._watch_tick)
@@ -1915,6 +2120,7 @@ class AlxEditApp(App):
         area.register_theme(_DIFF_THEME)
         area.theme = "alxdiff"
         self._set_readonly(area, state)
+        self._arm_scroll_watch(area)
         self._show_hunkbar(True)
         self._refresh_hunkbar()
         self._retab(area)
@@ -1924,19 +2130,40 @@ class AlxEditApp(App):
         """Rebuild the editor text + colors from the block model."""
         lines, adds, ghosts = render_blocks(state)
         area.load_text("\n".join(lines) + "\n")
-        self._paint_inline_diff(area, adds, ghosts)
+        self._paint_inline_diff(area, state, adds, ghosts)
+
+    def _repaint(self, area: TextArea, state: InlineDiffState) -> None:
+        """Re-apply the diff colors without reloading the text.
+
+        Used when only the "current hunk" background changes (on jump, or
+        when the user scrolls) — the text is untouched, so the viewport
+        stays where it is.
+        """
+        _lines, adds, ghosts = render_blocks(state)
+        self._paint_inline_diff(area, state, adds, ghosts)
 
     @staticmethod
     def _paint_inline_diff(
-        area: TextArea, adds: set[int], ghosts: set[int]
+        area: TextArea, state: InlineDiffState, adds: set[int], ghosts: set[int]
     ) -> None:
-        """Paint the inline diff: green = new/kept side, red strike = ghost."""
+        """Paint the inline diff: green = new/kept side, red strike = ghost.
+
+        Lines belonging to the hunk most recently jumped to get a
+        background (the ``*_cur`` variants), so the "just shown" change
+        stays easy to spot until the user scrolls away from it.
+        """
         highlights = area._highlights
         highlights.clear()
+        cur = None
+        if state.current_hunk is not None:
+            start, count = _hunk_span(state, state.current_hunk)
+            cur = set(range(start, start + count))
         for index in ghosts:
-            highlights[index].append((0, None, "diff_del"))
+            name = "diff_del_cur" if (cur is not None and index in cur) else "diff_del"
+            highlights[index].append((0, None, name))
         for index in adds:
-            highlights[index].append((0, None, "diff_add"))
+            name = "diff_add_cur" if (cur is not None and index in cur) else "diff_add"
+            highlights[index].append((0, None, name))
 
     @staticmethod
     def _set_readonly(area: TextArea, state: InlineDiffState) -> None:
@@ -1946,48 +2173,104 @@ class AlxEditApp(App):
 
     def _show_hunkbar(self, show: bool) -> None:
         self.query_one("#hunkbar", HunkBar).display = show
+        self.query_one("#hunk-sizer", PaneSizer).display = show
 
     def _refresh_hunkbar(self) -> None:
-        """Rebuild the hunk bar rows for the active diff."""
+        """Rebuild the hunk bar: one row per *pending* hunk.
+
+        Resolved hunks drop off the list; the left-hand label is a button
+        that jumps the editor to that change block.
+        """
         bar = self.query_one("#hunkbar", HunkBar)
         bar.remove_children()
         area = self.active_area
         state = self._inline_diff.get(area) if area is not None else None
         if state is None:
             return
-        pending = sum(1 for hunk in state.hunks if hunk.decision is None)
-        bar.mount(Label(f"hunks — {pending} pending", classes="hunk-title"))
-        for index, hunk in enumerate(state.hunks):
+        # (original index, hunk) for the hunks still pending — the index is
+        # what the button ids and the jump target use, so it stays stable as
+        # rows are removed.
+        pending = [(i, h) for i, h in enumerate(state.hunks) if h.decision is None]
+        bar.mount(Label(f"hunks — {len(pending)} pending", classes="hunk-title"))
+        for index, hunk in pending:
             bar.mount(
                 Horizontal(
-                    Label(
+                    Button(
                         f"#{index + 1} +{len(hunk.main)} −{len(hunk.ghost)}",
-                        classes="hunk-label",
-                    ),
-                    Button(
-                        "theirs",
                         compact=True,
-                        variant="success" if hunk.decision else "default",
-                        id=f"hunk-{index}-theirs",
+                        classes="hunk-jump",
+                        id=f"hunk-{index}-jump",
                     ),
-                    Button(
-                        "mine",
-                        compact=True,
-                        variant="error" if hunk.decision is False else "default",
-                        id=f"hunk-{index}-mine",
-                    ),
+                    Button("theirs", compact=True, id=f"hunk-{index}-theirs"),
+                    Button("mine", compact=True, id=f"hunk-{index}-mine"),
                     classes="hunk-row",
                 )
             )
 
+    @staticmethod
+    def _hunk_start_line(state: InlineDiffState, index: int) -> int:
+        """0-based line where the *index*-th hunk begins in the current view."""
+        start, _ = _hunk_span(state, index)
+        return start
+
+    def _jump_to_hunk(self, area: TextArea, state: InlineDiffState, index: int) -> None:
+        """Move the editor to a hunk, scroll it into view, and mark it as
+        the change just "shown" (background highlight)."""
+        line = self._hunk_start_line(state, index)
+        # Scroll first: a viewport move is exactly what clears the indicator,
+        # so the jump's own scroll drops any *previous* highlight. Only then
+        # do we mark this hunk as the one just shown and paint its background.
+        area.move_cursor((line, 0), center=True)
+        area.focus()
+        state.current_hunk = index
+        self._repaint(area, state)
+
+    def _arm_scroll_watch(self, area: TextArea) -> None:
+        """Clear the "just shown" indicator the moment the user scrolls.
+
+        Armed once per area; the handler is a no-op once that area is no
+        longer in an inline diff.
+        """
+        if area in self._scroll_watched:
+            return
+        self._scroll_watched.add(area)
+
+        def _handler(_old: float, _new: float) -> None:
+            self._on_diff_scroll(area)
+
+        self.watch(area, "scroll_y", _handler, init=False)
+
+    def _on_diff_scroll(self, area: TextArea) -> None:
+        """The editor scrolled — the "just shown" change is no longer where
+        the user is looking, so drop its highlight."""
+        state = self._inline_diff.get(area)
+        if state is None or state.current_hunk is None:
+            return
+        state.current_hunk = None
+        self._repaint(area, state)
+
+    @staticmethod
+    def _next_pending_index(state: InlineDiffState, after: int) -> Optional[int]:
+        """Index of the hunk to advance to after deciding ``after``.
+
+        Prefers the first pending hunk *below* the one just decided; if
+        there is none, wraps to the first pending hunk overall — so the
+        review cycles through the remaining changes. ``None`` if none is
+        pending (the caller then finishes the review).
+        """
+        pending = [i for i, h in enumerate(state.hunks) if h.decision is None]
+        if not pending:
+            return None
+        below = [i for i in pending if i > after]
+        return below[0] if below else pending[0]
+
     def _on_hunk_button(self, button_id: str) -> None:
-        """Decide one change block from the hunk bar: theirs / mine."""
-        parts = button_id.split("-")  # hunk-<n>-theirs | hunk-<n>-mine
-        if (
-            len(parts) != 3
-            or not parts[1].isdigit()
-            or parts[2] not in ("theirs", "mine")
-        ):
+        """Hunk bar: jump to a change block, or decide it (theirs / mine)."""
+        parts = button_id.split("-")  # hunk-<n>-jump | -theirs | -mine
+        if len(parts) != 3 or not parts[1].isdigit():
+            return
+        kind = parts[2]
+        if kind not in ("jump", "theirs", "mine"):
             return
         area = self.active_area
         state = self._inline_diff.get(area) if area is not None else None
@@ -1996,7 +2279,12 @@ class AlxEditApp(App):
         index = int(parts[1])
         if index >= len(state.hunks):
             return
-        state.hunks[index].decision = parts[2] == "theirs"
+        if kind == "jump":
+            self._jump_to_hunk(area, state, index)
+            return
+        state.hunks[index].decision = kind == "theirs"
+        if state.current_hunk == index:
+            state.current_hunk = None  # the just-resolved hunk is no longer "shown"
         self._rerender(area, state)
         if all(hunk.decision is not None for hunk in state.hunks):
             was_tracked = state.path in self._changes
@@ -2013,7 +2301,10 @@ class AlxEditApp(App):
                 self.notify("all hunks resolved — matches baseline", title="Diff")
         else:
             self._set_readonly(area, state)
+            next_index = self._next_pending_index(state, index)
             self._refresh_hunkbar()
+            if next_index is not None:
+                self._jump_to_hunk(area, state, next_index)
 
     def _finish_review(self, area: TextArea, state: InlineDiffState) -> None:
         """Every hunk decided: settle the decision and drop the diff state."""

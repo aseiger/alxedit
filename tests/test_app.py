@@ -9,7 +9,7 @@ from textual.widgets import Button, ListView, TabPane, TabbedContent, TextArea
 
 from alxedit2 import sessions
 from alxedit2.__main__ import resolve_root
-from alxedit2.app import AlxEditApp, Explorer, SessionScreen
+from alxedit2.app import AlxEditApp, Explorer, PaneSizer, SessionScreen
 from alxedit2.languages import language_for_path
 
 
@@ -21,6 +21,132 @@ def repo(tmp_path: Path) -> Path:
     (tmp_path / ".hidden").write_text("secret\n")
     (tmp_path / "README.md").write_text("# hi\n")
     return tmp_path
+
+
+def _mouse_move(app, x: float, y: float) -> None:
+    from textual import events
+
+    app.post_message(
+        events.MouseMove(
+            None, x, y, 0, 0, 1, False, False, False,
+            screen_x=x, screen_y=y,
+        )
+    )
+
+
+def _mouse_up(app, x: float, y: float) -> None:
+    from textual import events
+
+    app.post_message(
+        events.MouseUp(
+            None, x, y, 0, 0, 1, False, False, False,
+            screen_x=x, screen_y=y,
+        )
+    )
+
+
+async def test_sizers_flank_their_panes(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        sidebar = app.query_one("#sidebar")
+        tabs = app.query_one("#tabs")
+        sidebar_sizer = app.query_one("#sidebar-sizer", PaneSizer)
+        assert sidebar_sizer.pane_id == "sidebar"
+        assert sidebar_sizer.side == "left"
+        assert sidebar.region.x < sidebar_sizer.region.x < tabs.region.x
+        assert sidebar_sizer.region.width == 1
+        # the hunk panel (and its sizer) are hidden until a review opens
+        hunk_sizer = app.query_one("#hunk-sizer", PaneSizer)
+        hunkbar = app.query_one("#hunkbar")
+        assert hunk_sizer.pane_id == "hunkbar"
+        assert hunk_sizer.side == "right"
+        assert not hunk_sizer.display
+        assert not hunkbar.display
+
+
+async def test_sidebar_resizes_with_hotkeys(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        before = app.pane_value("sidebar")
+        await pilot.press("alt+right")
+        await pilot.pause()
+        assert app.pane_value("sidebar") == before + 4
+        await pilot.press("alt+left")
+        await pilot.pause()
+        assert app.pane_value("sidebar") == before
+
+
+async def test_pane_widths_clamped(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.set_pane_value("sidebar", 1)
+        assert app.pane_value("sidebar") == 10.0
+        app.set_pane_value("sidebar", 99)
+        assert app.pane_value("sidebar") == 60.0
+        app.set_pane_value("hunkbar", 1)
+        assert app.pane_value("hunkbar") == 15.0
+        app.set_pane_value("hunkbar", 99)
+        assert app.pane_value("hunkbar") == 60.0
+
+
+async def test_dragging_sizer_resizes_sidebar(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        sizer = app.query_one("#sidebar-sizer", PaneSizer)
+        x0 = sizer.region.x
+        before = app.pane_value("sidebar")
+        await pilot.mouse_down(sizer)
+        await pilot.pause()
+        assert app._resizing_pane == "sidebar"
+        # drag 10 columns to the right -> sidebar widens
+        _mouse_move(app, x0 + 10, 5)
+        await pilot.pause()
+        assert app.pane_value("sidebar") > before
+        _mouse_up(app, x0 + 10, 5)
+        await pilot.pause()
+        assert app._resizing_pane is None
+        assert "resizing" not in sizer.classes
+
+
+async def test_dragging_hunk_sizer_widens_hunkbar(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        app._show_hunkbar(True)
+        await pilot.pause()
+        sizer = app.query_one("#hunk-sizer", PaneSizer)
+        hunkbar = app.query_one("#hunkbar")
+        # sizer sits immediately left of the hunk panel
+        assert sizer.region.x + 1 == hunkbar.region.x
+        before = app.pane_value("hunkbar")
+        x0 = sizer.region.x
+        await pilot.mouse_down(sizer)
+        await pilot.pause()
+        assert app._resizing_pane == "hunkbar"
+        # drag 8 columns to the LEFT -> right-hand pane widens
+        _mouse_move(app, x0 - 8, 5)
+        await pilot.pause()
+        assert app.pane_value("hunkbar") == before + 8
+        _mouse_up(app, x0 - 8, 5)
+        await pilot.pause()
+        assert app._resizing_pane is None
+
+
+async def test_hunkbar_resizes_with_hotkeys(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        before = app.pane_value("hunkbar")
+        await pilot.press("alt+shift+left")
+        await pilot.pause()
+        assert app.pane_value("hunkbar") == before + 4
+        await pilot.press("alt+shift+right")
+        await pilot.pause()
+        assert app.pane_value("hunkbar") == before
 
 
 def test_resolve_root_rules(tmp_path: Path) -> None:
@@ -984,6 +1110,9 @@ async def test_new_file_saved_by_editor_appears_in_tree(repo: Path) -> None:
         await pilot.pause()
 
         tree = app.query_one(Explorer)
+        # DirectoryTree.reload_node is async (loads via a worker): await a
+        # stable state instead of racing the in-flight reload.
+        await tree.reload_node(tree.root)
         names = {node.data.path.name for node in tree.root.children}
         assert "fresh.py" in names
 
@@ -1092,6 +1221,136 @@ async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
         app.action_save()
         await pilot.pause()
         assert (repo / "app.js").read_text() == "one\nTWO\nthree\n"
+
+
+async def test_hunk_jump_moves_editor_to_block(repo: Path) -> None:
+    """Clicking a hunk's label jumps the editor to that change block."""
+    (repo / "app.js").write_text("one\ntwo\nthree\n")
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        (repo / "app.js").write_text("one\nTWO\nthree\nfour\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        state = app._inline_diff[area]
+        assert len(state.hunks) == 2
+        # Start line of each hunk in the current (both-sides) view.
+        assert app._hunk_start_line(state, 0) == 1  # the "⌫ two" ghost line
+        assert app._hunk_start_line(state, 1) == 4  # the "four" line
+
+        app._on_hunk_button("hunk-0-jump")
+        await pilot.pause()
+        assert area.cursor_location == (1, 0)
+
+        app._on_hunk_button("hunk-1-jump")
+        await pilot.pause()
+        assert area.cursor_location == (4, 0)
+
+
+async def test_resolved_hunk_leaves_the_list(repo: Path) -> None:
+    """A resolved hunk drops off the hunk bar; the remaining hunks' jump
+    offsets adapt to the re-rendered view."""
+    (repo / "app.js").write_text("one\ntwo\nthree\n")
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        (repo / "app.js").write_text("one\nTWO\nthree\nfour\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        state = app._inline_diff[area]
+        bar = app.query_one("#hunkbar")
+
+        def jump_ids() -> list[str]:
+            return [
+                b.id for b in bar.query(Button) if b.id and b.id.endswith("-jump")
+            ]
+
+        assert jump_ids() == ["hunk-0-jump", "hunk-1-jump"]
+
+        # Resolve hunk 0 (keep the agent's "TWO") -> it leaves the list.
+        app._on_hunk_button("hunk-0-theirs")
+        await pilot.pause()
+        assert jump_ids() == ["hunk-1-jump"]
+
+        # Hunk 1's offset shifted up: the "⌫ two" ghost line is gone.
+        assert app._hunk_start_line(state, 1) == 3
+        app._on_hunk_button("hunk-1-jump")
+        await pilot.pause()
+        assert area.cursor_location == (3, 0)
+
+
+async def test_resolving_a_hunk_advances_to_next_pending(repo: Path) -> None:
+    """Resolving a hunk auto-advances the editor to the next pending change."""
+    NL = chr(10)
+    (repo / "app.js").write_text("one" + NL + "two" + NL + "three" + NL)
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        (repo / "app.js").write_text("one" + NL + "TWO" + NL + "three" + NL + "four" + NL)
+        app._watch_tick()
+        await pilot.pause()
+
+        state = app._inline_diff[area]
+        assert len(state.hunks) == 2
+        # Resolve hunk 0 -> the editor should land on hunk 1 (next pending below).
+        app._on_hunk_button("hunk-0-theirs")
+        await pilot.pause()
+        assert state.current_hunk == 1
+        assert area.cursor_location == (app._hunk_start_line(state, 1), 0)
+
+
+async def test_current_hunk_indicator_set_on_jump_cleared_on_scroll(repo: Path) -> None:
+    """The change most recently jumped to is highlighted; a real scroll —
+    not a direct handler call — drops it via the armed watcher."""
+    NL = chr(10)
+    # Long enough that the diff view overflows a 30-row viewport, so the
+    # jump (and the scroll back) really move the viewport.
+    base = ["line %03d" % i for i in range(1, 61)]
+    (repo / "app.js").write_text(NL.join(base) + NL)
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        edited = base.copy()
+        edited[50] = "EDITED LINE 51"
+        (repo / "app.js").write_text(NL.join(edited) + NL)
+        app._watch_tick()
+        await pilot.pause()
+
+        state = app._inline_diff[area]
+        assert len(state.hunks) == 1
+        # The scroll-clear watcher is armed for this area.
+        assert area in app._scroll_watched
+
+        def highlight_names() -> set:
+            return {
+                name
+                for spans in area._highlights.values()
+                for (_, _, name) in spans
+            }
+
+        # Jumping to the hunk marks it "shown" and paints the _cur styles.
+        app._on_hunk_button("hunk-0-jump")
+        await pilot.pause()
+        assert state.current_hunk == 0
+        assert "diff_add_cur" in highlight_names()
+        assert "diff_del_cur" in highlight_names()
+        # The jump really scrolled the viewport — that is what makes the
+        # assertion above meaningful: the jump's own scroll fired the
+        # watcher, yet the freshly set highlight survived it.
+        assert area.scroll_y > 0
+
+        # The user scrolls the editor (public API, immediate) -> the armed
+        # watcher drops the "shown" highlight.
+        area.scroll_home(animate=False, immediate=True)
+        await pilot.pause()
+        assert state.current_hunk is None
+        assert not any(n.endswith("_cur") for n in highlight_names())
 
 
 async def test_hunk_all_mine_clean_buffer_no_dot(repo: Path) -> None:
