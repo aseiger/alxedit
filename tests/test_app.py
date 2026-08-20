@@ -529,8 +529,9 @@ async def test_external_edit_of_open_clean_file_shows_diff_then_adopts(
         assert buf.external is True
         assert area in app._inline_diff
         assert area.is_read_only  # review mode while hunks are pending
-        assert "⌫ const a = 1" in area.text  # removed line: red ghost
-        assert "const a = 999" in area.text  # added line: real, green
+        # one-line change: a modified pair, both sides marked M
+        assert "M const a = 1" in area.text  # old line: yellow, struck
+        assert "M const a = 999" in area.text  # new line: yellow
         rec = app._changes[repo / "app.js"]
         assert rec.status == "modified"
         assert rec.baseline_text == "const a = 1;\n"
@@ -564,8 +565,8 @@ async def test_external_edit_of_dirty_file_shows_diff_then_restores(repo: Path) 
         assert buf.external is True
         assert area in app._inline_diff
         assert area.is_read_only  # review mode while hunks are pending
-        assert "⌫ const a = 999" in area.text
-        assert "const a = 'mine'" in area.text
+        assert "M const a = 999" in area.text
+        assert "M const a = 'mine'" in area.text
         rec = app._changes[repo / "app.js"]
         assert rec.baseline_text == "const a = 1;\n"
 
@@ -1130,8 +1131,8 @@ async def test_inline_diff_in_editor_and_esc_restores(repo: Path) -> None:
         # the diff appears automatically, no key press needed
         assert area in app._inline_diff
         assert area.is_read_only  # review mode while hunks are pending
-        assert "⌫ const a = 1" in area.text
-        assert "const a = 999" in area.text
+        assert "M const a = 1" in area.text
+        assert "M const a = 999" in area.text
 
         # ctrl+d also exits (esc is used by some widgets)
         await pilot.press("ctrl+d")
@@ -1165,6 +1166,46 @@ async def test_inline_diff_in_editor_and_esc_restores(repo: Path) -> None:
         assert area not in app._inline_diff
 
 
+async def test_diff_kinds_rendered_distinctly(repo: Path) -> None:
+    """+ green = addition, ⌫ red strike = deletion, M yellow = modified."""
+    (repo / "kinds.txt").write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n")
+    app = AlxEditApp(root=repo, paths=[repo / "kinds.txt"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+
+        # one external edit producing all three kinds: beta -> BETA
+        # (modified pair), delta removed (deletion), zeta added (addition)
+        (repo / "kinds.txt").write_text("alpha\nBETA\ngamma\nepsilon\nzeta\n")
+        app._watch_tick()
+        await pilot.pause()
+
+        assert area in app._inline_diff
+        state = app._inline_diff[area]
+        assert len(state.hunks) == 3
+
+        lines = area.text.splitlines()
+        assert "M beta" in lines  # old line of the modified pair
+        assert "M BETA" in lines  # new line of the modified pair
+        assert "⌫ delta" in lines  # pure deletion
+        assert "+ zeta" in lines  # pure addition
+
+        # the pair is adjacent; the blocks keep file order
+        assert (
+            lines.index("M beta") + 1 == lines.index("M BETA")
+            < lines.index("⌫ delta")
+            < lines.index("+ zeta")
+        )
+
+        def style_of(line: str) -> str:
+            return area._highlights[lines.index(line)][0][2]
+
+        assert style_of("M beta") == "diff_modold"
+        assert style_of("M BETA") == "diff_mod"
+        assert style_of("⌫ delta") == "diff_del"
+        assert style_of("+ zeta") == "diff_add"
+
+
 async def test_save_from_inline_diff_strips_ghost_lines(repo: Path) -> None:
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(100, 30)) as pilot:
@@ -1177,10 +1218,10 @@ async def test_save_from_inline_diff_strips_ghost_lines(repo: Path) -> None:
 
         # the diff appears automatically on the active tab
         assert area in app._inline_diff
-        assert "⌫ const a = 1" in area.text
+        assert "M const a = 1" in area.text
 
         # saving from the diff view writes the real content only — the
-        # ghost line (old content) must not be written back
+        # old line of the modified pair must not be written back
         app.action_save()
         await pilot.pause()
         assert (repo / "app.js").read_text() == "const a = 999;\n"
@@ -1237,7 +1278,7 @@ async def test_hunk_jump_moves_editor_to_block(repo: Path) -> None:
         state = app._inline_diff[area]
         assert len(state.hunks) == 2
         # Start line of each hunk in the current (both-sides) view.
-        assert app._hunk_start_line(state, 0) == 1  # the "⌫ two" ghost line
+        assert app._hunk_start_line(state, 0) == 1  # the "M two" modified line
         assert app._hunk_start_line(state, 1) == 4  # the "four" line
 
         app._on_hunk_button("hunk-0-jump")
@@ -1276,7 +1317,7 @@ async def test_resolved_hunk_leaves_the_list(repo: Path) -> None:
         await pilot.pause()
         assert jump_ids() == ["hunk-1-jump"]
 
-        # Hunk 1's offset shifted up: the "⌫ two" ghost line is gone.
+        # Hunk 1's offset shifted up: the "M two" modified line is gone.
         assert app._hunk_start_line(state, 1) == 3
         app._on_hunk_button("hunk-1-jump")
         await pilot.pause()
@@ -1338,8 +1379,8 @@ async def test_current_hunk_indicator_set_on_jump_cleared_on_scroll(repo: Path) 
         app._on_hunk_button("hunk-0-jump")
         await pilot.pause()
         assert state.current_hunk == 0
-        assert "diff_add_cur" in highlight_names()
-        assert "diff_del_cur" in highlight_names()
+        assert "diff_mod_cur" in highlight_names()
+        assert "diff_modold_cur" in highlight_names()
         # The jump really scrolled the viewport — that is what makes the
         # assertion above meaningful: the jump's own scroll fired the
         # watcher, yet the freshly set highlight survived it.

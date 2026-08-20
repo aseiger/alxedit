@@ -56,10 +56,14 @@ _DIFF_THEME = TextAreaTheme(
     syntax_styles={
         "diff_add": Style(color="green"),
         "diff_del": Style(color="red", strike=True),
+        "diff_mod": Style(color="yellow"),
+        "diff_modold": Style(color="yellow", strike=True),
         # The change block most recently jumped to ("shown") gets a
         # background; cleared as soon as the user scrolls the editor.
         "diff_add_cur": Style(color="green", bgcolor="#33335f"),
         "diff_del_cur": Style(color="red", strike=True, bgcolor="#33335f"),
+        "diff_mod_cur": Style(color="yellow", bgcolor="#33335f"),
+        "diff_modold_cur": Style(color="yellow", strike=True, bgcolor="#33335f"),
     },
 )
 
@@ -119,9 +123,14 @@ class ChangeRecord:
     seen_at: float
 
 
-#: Prefix of "ghost" lines in the inline diff view: content that exists only
-#: on the other side (baseline or disk) and is stripped again on save.
+#: Line prefixes in the inline diff view, by kind:
+#:   "⌫"  pure deletion  (ghost side, red strikethrough)
+#:   "+"  pure addition  (new side, green)
+#:   "M"  modified pair  (old line struck, new line plain; both yellow)
+#: Stripped again on save.
 GHOST_PREFIX = "⌫"
+ADD_PREFIX = "+"
+MOD_PREFIX = "M"
 
 
 @dataclass
@@ -189,37 +198,43 @@ def _hunk_span(state: "InlineDiffState", index: int) -> tuple[int, int]:
     return line, 0
 
 
-def render_blocks(state: "InlineDiffState") -> tuple[list[str], set[int], set[int]]:
+def render_blocks(state: "InlineDiffState") -> tuple[list[str], list[str]]:
     """Render the block model into view lines.
 
-    Pending hunks show both sides (ghost lines get the :data:`GHOST_PREFIX`,
-    the plain-save side is marked green); decided hunks show only the kept
-    side (accepted = green, rejected = plain). Returns
-    ``(lines, added_indices, ghost_indices)``.
+    Pending hunks show both sides: ghost/main lines are paired up
+    positionally — a pair is a **modified** line (``M``, yellow, old side
+    struck), the unpaired ghost remainder a **deletion** (``⌫``, red
+    strike), the unpaired main remainder an **addition** (``+``, green).
+    Decided hunks show only the kept side (plain). Returns
+    ``(lines, kinds)`` where ``kinds[i]`` is ``"ctx"``, ``"add"``,
+    ``"del"``, ``"mod"`` or ``"modold"``.
     """
     lines: list[str] = []
-    adds: set[int] = set()
-    ghosts: set[int] = set()
+    kinds: list[str] = []
     for block in state.blocks:
         if not isinstance(block, Hunk):
             lines.extend(block)
+            kinds.extend(["ctx"] * len(block))
             continue
         if block.decision is None:
-            for line in block.ghost:
-                ghosts.add(len(lines))
-                lines.append(f"{GHOST_PREFIX} {line}")
-            for line in block.main:
-                adds.add(len(lines))
-                lines.append(line)
-        elif block.decision is True:
-            # "theirs" kept: the external content, shown green
-            for line in _hunk_take(state, block, True):
-                adds.add(len(lines))
-                lines.append(line)
+            paired = min(len(block.ghost), len(block.main))
+            for i in range(paired):
+                kinds.append("modold")
+                lines.append(f"{MOD_PREFIX} {block.ghost[i]}")
+                kinds.append("mod")
+                lines.append(f"{MOD_PREFIX} {block.main[i]}")
+            for i in range(paired, len(block.ghost)):
+                kinds.append("del")
+                lines.append(f"{GHOST_PREFIX} {block.ghost[i]}")
+            for i in range(paired, len(block.main)):
+                kinds.append("add")
+                lines.append(f"{ADD_PREFIX} {block.main[i]}")
         else:
-            # "mine" kept: the user's content, back to plain
-            lines.extend(_hunk_take(state, block, False))
-    return lines, adds, ghosts
+            # Decided: only the kept side, back to plain.
+            keep = _hunk_take(state, block, block.decision)
+            lines.extend(keep)
+            kinds.extend(["ctx"] * len(keep))
+    return lines, kinds
 
 
 def resolved_text(state: "InlineDiffState") -> str:
@@ -2128,9 +2143,9 @@ class AlxEditApp(App):
 
     def _rerender(self, area: TextArea, state: InlineDiffState) -> None:
         """Rebuild the editor text + colors from the block model."""
-        lines, adds, ghosts = render_blocks(state)
+        lines, kinds = render_blocks(state)
         area.load_text("\n".join(lines) + "\n")
-        self._paint_inline_diff(area, state, adds, ghosts)
+        self._paint_inline_diff(area, state, kinds)
 
     def _repaint(self, area: TextArea, state: InlineDiffState) -> None:
         """Re-apply the diff colors without reloading the text.
@@ -2139,18 +2154,28 @@ class AlxEditApp(App):
         when the user scrolls) — the text is untouched, so the viewport
         stays where it is.
         """
-        _lines, adds, ghosts = render_blocks(state)
-        self._paint_inline_diff(area, state, adds, ghosts)
+        _lines, kinds = render_blocks(state)
+        self._paint_inline_diff(area, state, kinds)
 
-    @staticmethod
+    #: diff line kind -> highlight base name
+    _KIND_STYLES: ClassVar[dict[str, str]] = {
+        "add": "diff_add",
+        "del": "diff_del",
+        "mod": "diff_mod",
+        "modold": "diff_modold",
+    }
+
+    @classmethod
     def _paint_inline_diff(
-        area: TextArea, state: InlineDiffState, adds: set[int], ghosts: set[int]
+        cls, area: TextArea, state: InlineDiffState, kinds: list[str]
     ) -> None:
-        """Paint the inline diff: green = new/kept side, red strike = ghost.
+        """Paint the inline diff by line kind (see :func:`render_blocks`).
 
-        Lines belonging to the hunk most recently jumped to get a
-        background (the ``*_cur`` variants), so the "just shown" change
-        stays easy to spot until the user scrolls away from it.
+        ``+`` green = addition, ``⌫`` red strike = deletion, ``M`` yellow =
+        modified (old line struck, new line plain). Lines belonging to the
+        hunk most recently jumped to get a background (the ``*_cur``
+        variants), so the "just shown" change stays easy to spot until the
+        user scrolls away from it.
         """
         highlights = area._highlights
         highlights.clear()
@@ -2158,11 +2183,11 @@ class AlxEditApp(App):
         if state.current_hunk is not None:
             start, count = _hunk_span(state, state.current_hunk)
             cur = set(range(start, start + count))
-        for index in ghosts:
-            name = "diff_del_cur" if (cur is not None and index in cur) else "diff_del"
-            highlights[index].append((0, None, name))
-        for index in adds:
-            name = "diff_add_cur" if (cur is not None and index in cur) else "diff_add"
+        for index, kind in enumerate(kinds):
+            base = cls._KIND_STYLES.get(kind)
+            if base is None:
+                continue
+            name = base + "_cur" if (cur is not None and index in cur) else base
             highlights[index].append((0, None, name))
 
     @staticmethod
