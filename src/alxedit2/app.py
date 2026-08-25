@@ -903,6 +903,7 @@ class HelpScreen(ModalScreen[None]):
             "              to it; resolved hunks drop off the list;\n"
             "              all decided → editable again;\n"
             "              ● tab = change not in baseline yet — ctrl+s commits it\n"
+            "              🔒 tab = read-only (a session-baseline file)\n"
             "alt+←/→       resize the sidebar (or drag the divider\n"
             "              between explorer and editor)\n"
             "alt+shift+←/→ resize the hunk panel (or drag its divider\n"
@@ -1991,7 +1992,8 @@ class AlxEditApp(App):
         differs from the disk); a bold ``●`` marks a buffer that is **not
         committed** to the session baseline (buffer differs from the
         mirror); ``†`` marks a file that changed on disk outside the
-        editor; ``⇄`` marks the inline diff review in progress.
+        editor; ``⇄`` marks the inline diff review in progress; ``🔒``
+        marks a read-only tab (a session-store file: the baseline).
         """
         buf = self.buffers.get(area)
         pane = self._panes.get(area)
@@ -2001,6 +2003,9 @@ class AlxEditApp(App):
         # Colored file name while unsaved (buffer != disk).
         name_style = Style(bold=True, color=theme.warning) if buf.unsaved else None
         label = Text(buf.title, style=name_style)
+        # 🔒 while read-only (session-store file: the baseline).
+        if getattr(area, "read_only", False):
+            label.append(" 🔒", Style(bold=True, color=theme.primary))
         # ● while not committed to the session baseline (buffer != mirror).
         # While the diff is on screen, show the pre-diff dirty state.
         dirty = buf.modified and (

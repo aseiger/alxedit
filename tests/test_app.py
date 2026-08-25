@@ -14,6 +14,7 @@ from textual.widgets import (
     TabbedContent,
     TextArea,
 )
+from textual.widgets._tabbed_content import ContentTabs
 
 from alxedit2 import sessions
 from alxedit2 import settings as project_settings
@@ -2420,6 +2421,10 @@ async def test_session_store_files_open_read_only(repo: Path) -> None:
         await pilot.pause()
         area = await app.open_path(mirror)
         assert area.read_only
+        # the tab carries a lock mark
+        tabs = app._tabbed.get_child_by_type(ContentTabs)
+        label = tabs.get_content_tab(app._panes[area].id).label
+        assert "🔒" in label.plain
         before = area.text
         await pilot.press(*list("x"))
         await pilot.pause()
@@ -2428,6 +2433,8 @@ async def test_session_store_files_open_read_only(repo: Path) -> None:
         await pilot.press("ctrl+s")
         await pilot.pause()
         assert mirror.read_text() == "const a = 1;\n"
-        # a plain project file stays editable
+        # a plain project file stays editable, and has no lock mark
         area2 = await app.open_path(repo / "app.js")
         assert not area2.read_only
+        label2 = tabs.get_content_tab(app._panes[area2].id).label
+        assert "🔒" not in label2.plain
