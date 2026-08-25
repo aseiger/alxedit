@@ -1114,6 +1114,7 @@ class SessionScreen(ModalScreen[SessionChoice]):
         sessions.delete_session(app.root, sid)
         self._sessions = [s for s in self._sessions if s.id != sid]
         await self._refresh_list()
+        app._refresh_tree()  # .alxedit/<sid> just left the explorer
         self.app.notify(f"deleted session {sid}", title="Sessions")
 
     def action_cancel(self) -> None:
@@ -1817,6 +1818,7 @@ class AlxEditApp(App):
         screen.update(total, total)
         await asyncio.sleep(0)
         screen.dismiss()
+        self._refresh_tree()  # .alxedit/<sid> just appeared in the explorer
         return sid
 
     def _activate_session(self, sid: str) -> None:

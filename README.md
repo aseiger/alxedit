@@ -107,8 +107,9 @@ copy — not memory, not git.
 
 Sessions are plain files: inspect them, `cp -r` one to preserve it,
 `rm -rf .alxedit/<id>` to remove one manually. (`.alxedit/` itself is
-excluded from the mirror.) They appear in the explorer and open
-**read-only** in a tab — they *are* the baseline, so saving over one in
+excluded from the mirror.) They appear in the explorer, which refreshes
+on its own when a session is created or deleted, and open **read-only**
+in a tab — they *are* the baseline, so saving over one in
 place would silently move the baseline; use Save As to copy one out if
 you want to keep it. The ctrl+click menu offers no file operations for
 entries inside `.alxedit/` (no rename, delete, new-file, or

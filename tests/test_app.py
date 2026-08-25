@@ -769,6 +769,67 @@ async def test_cannot_delete_active_session(repo: Path) -> None:
         assert app.session_id == active
 
 
+async def test_explorer_refreshes_on_session_create_and_delete(repo: Path) -> None:
+    """The explorer picks up .alxedit/<sid> when a session is created and
+    drops it when one is deleted — no manual tree refresh needed."""
+
+    async def store_children(ex):
+        """The loaded child names of the .alxedit folder (expanding it)."""
+        node = next(
+            (
+                c
+                for c in ex.root.children
+                if c.data is not None and c.data.path.name == ".alxedit"
+            ),
+            None,
+        )
+        if node is None:
+            return set()
+        if not node.children:
+            node.expand()
+            if not await _wait_for(pilot, lambda: bool(node.children), tries=20):
+                return set()
+        return {c.data.path.name for c in node.children if c.data is not None}
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        s0 = app.session_id
+        assert s0 is not None  # the fixture session auto-activates
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+
+        # 1. create a session from the Session screen: the explorer picks
+        #    up .alxedit/<s1> on its own
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        app.screen.query_one("#sess-new", Button).press()
+        await _wait_for(
+            pilot,
+            lambda: app.session_id is not None and app.session_id != s0,
+            tries=60,
+        )
+        s1 = app.session_id
+        assert s0 in await store_children(ex)
+        assert s1 in await store_children(ex)
+
+        # 2. delete s0 (not the active one): it leaves the explorer too
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        _select_session(app.screen, s0)
+        app.screen.query_one("#sess-delete", Button).press()
+        app.screen.query_one("#sess-delete", Button).press()
+        await pilot.pause()
+        assert not (repo / ".alxedit" / s0).exists()
+        app.screen.query_one("#sess-cancel", Button).press()
+        await pilot.pause()
+        kids = await store_children(ex)
+        assert s1 in kids
+        assert s0 not in kids
+
+
 # --------------------------------------------------------------------------- #
 # external change tracking
 # --------------------------------------------------------------------------- #
