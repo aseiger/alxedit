@@ -21,6 +21,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
+from textual.widget import Widget
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
@@ -42,6 +43,7 @@ from textual.widgets._tabbed_content import ContentTabs
 from textual._text_area_theme import TextAreaTheme
 
 from . import sessions
+from . import settings as project_settings
 from .languages import language_for_path
 
 
@@ -807,6 +809,10 @@ class HelpScreen(ModalScreen[None]):
             "              starts as a plain editor — no tree copy,\n"
             "              no tracked changes. Press this to start\n"
             "              a session if you want them.\n"
+            "Settings btn  top bar — what the session mirror tracks\n"
+            "              (ctrl+.): the explorer always shows every\n"
+            "              file; 'ignore' excludes any file/folder,\n"
+            "              'track' includes dot files (off by default)\n"
             "esc / ctrl+d  abandon a review (keeps your side; reviews\n"
             "              appear automatically when an open file\n"
             "              changes outside)\n"
@@ -1041,6 +1047,185 @@ class SessionScreen(ModalScreen[SessionChoice]):
             await self.action_delete()
         elif event.button.id == "sess-cancel":
             self.action_cancel()
+
+
+class SettingsScreen(ModalScreen[None]):
+    """Project settings (``.alxeditrc``): what the session mirror tracks.
+
+    The explorer always shows *every* file in the project; these settings
+    control the mirror (the diff/revert baseline) and change tracking:
+
+    - dot files/folders are untracked by default — "Track" includes a
+      specific one (e.g. ``.env``);
+    - "Ignore" excludes any file or folder (e.g. a massive image).
+
+    Changes persist immediately and re-reconcile the active session.
+    """
+
+    CSS = """
+    SettingsScreen {
+        align: left middle;
+        height: auto;
+        max-height: 28;
+        width: auto;
+        min-width: 64;
+        max-width: 90;
+    }
+    SettingsScreen #settings-head {
+        text-style: bold;
+        padding: 0 2 1 2;
+    }
+    SettingsScreen .settings--section {
+        text-style: bold;
+        color: $text-muted;
+        padding: 1 0 0 2;
+    }
+    SettingsScreen .settings--row {
+        height: 3;
+        align-vertical: middle;
+        padding: 0 2;
+    }
+    SettingsScreen .settings--row Label {
+        width: 1fr;
+        text-overflow: ellipsis;
+    }
+    SettingsScreen .settings--row Button {
+        width: 5;
+    }
+    SettingsScreen .settings--none {
+        color: $text-muted;
+        padding: 0 2;
+    }
+    SettingsScreen .settings--add {
+        height: 3;
+        align: left middle;
+        margin: 1 2;
+    }
+    SettingsScreen .settings--add Input {
+        width: 1fr;
+        margin-right: 1;
+    }
+    SettingsScreen .settings--add Button {
+        width: 8;
+        margin-left: 1;
+    }
+    SettingsScreen .settings--buttons {
+        height: 3;
+        align: right middle;
+        padding: 0 2;
+    }
+    SettingsScreen .settings--buttons Button {
+        width: 10;
+    }
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        current: project_settings.Settings,
+        apply: Callable[[project_settings.Settings], None],
+    ) -> None:
+        super().__init__()
+        self._root = root
+        self._ignore: list[str] = list(current.ignore)
+        self._track: list[str] = list(current.track)
+        self._apply = apply
+
+    def compose(self) -> ComposeResult:
+        yield Label(
+            "settings — what the session mirror tracks",
+            id="settings-head",
+        )
+        yield Vertical(id="settings-body")
+        with Horizontal(classes="settings--add"):
+            yield Input(
+                placeholder="path inside the project, e.g. assets/images or .env",
+                id="settings-path",
+            )
+            yield Button("Ignore", id="settings-add-ignore")
+            yield Button("Track", id="settings-add-track")
+        with Horizontal(classes="settings--buttons"):
+            yield Button("Done", variant="primary", id="settings-done")
+
+    async def on_mount(self) -> None:
+        await self._refresh()
+
+    async def _refresh(self) -> None:
+        """Rebuild the entry rows (after an add/remove)."""
+        body = self.query_one("#settings-body", Vertical)
+        await body.remove_children()
+        rows: list[Widget] = [
+            Label(
+                "ignore — never mirrored or tracked",
+                classes="settings--section",
+            )
+        ]
+        if not self._ignore:
+            rows.append(Label("(none)", classes="settings--none"))
+        for i, entry in enumerate(self._ignore):
+            rows.append(
+                Horizontal(
+                    Label(entry),
+                    Button("x", id="settings-remove", name=f"ignore:{i}"),
+                    classes="settings--row",
+                )
+            )
+        rows.append(
+            Label(
+                "track — dot files to include (off by default)",
+                classes="settings--section",
+            )
+        )
+        if not self._track:
+            rows.append(Label("(none)", classes="settings--none"))
+        for i, entry in enumerate(self._track):
+            rows.append(
+                Horizontal(
+                    Label(entry),
+                    Button("x", id="settings-remove", name=f"track:{i}"),
+                    classes="settings--row",
+                )
+            )
+        await body.mount(*rows)
+
+    def _add_entry(self, which: str) -> bool:
+        """Read the input, normalize it, and add it to *which* list."""
+        raw = self.query_one("#settings-path", Input).value
+        entry = project_settings.normalize(raw)
+        if not entry or ".." in entry.split("/"):
+            self.app.notify("enter a path inside the project root", title="Settings")
+            return False
+        lst = self._ignore if which == "ignore" else self._track
+        if entry in lst:
+            return False
+        lst.append(entry)
+        return True
+
+    async def _add(self, which: str) -> None:
+        if self._add_entry(which):
+            self.query_one("#settings-path", Input).value = ""
+            await self._commit()
+
+    async def _commit(self) -> None:
+        """Persist + apply, then refresh the rows."""
+        self._apply(
+            project_settings.Settings(tuple(self._ignore), tuple(self._track))
+        )
+        await self._refresh()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "settings-add-ignore":
+            await self._add("ignore")
+        elif bid == "settings-add-track":
+            await self._add("track")
+        elif bid == "settings-remove":
+            which, idx = event.button.name.split(":", 1)
+            lst = self._ignore if which == "ignore" else self._track
+            lst.pop(int(idx))
+            await self._commit()
+        elif bid == "settings-done":
+            self.dismiss()
 
 
 # --------------------------------------------------------------------------- #
@@ -1301,6 +1486,7 @@ class AlxEditApp(App):
         Binding("f4,ctrl+w", "close_buffer", "Close tab", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
         Binding("f2", "changes", "Changes", show=False),
+        Binding("ctrl+.", "settings", "Settings", show=False),
         Binding("f1", "help", "Help", show=False),
         Binding("alt+left", "sidebar_left", "Narrow sidebar", show=False),
         Binding("alt+right", "sidebar_right", "Widen sidebar", show=False),
@@ -1348,6 +1534,8 @@ class AlxEditApp(App):
         self._pane_counter = 0
         #: The active session id under ``.alxedit/`` (the diff baseline).
         self.session_id: Optional[str] = None
+        #: Project settings (``.alxeditrc``): what the mirror tracks.
+        self._settings = project_settings.load(self.root)
         #: path -> (size, mtime_ns) as of the last watcher tick.
         self._snap: dict[Path, tuple[int, int]] = {}
         #: path -> tracked external change.
@@ -1389,6 +1577,7 @@ class AlxEditApp(App):
             yield Button("Close", compact=True, id="btn-close")
             yield Button("Changes", compact=True, id="btn-changes")
             yield Button("Session", compact=True, id="btn-session")
+            yield Button("Settings", compact=True, id="btn-settings")
         with Horizontal(id="middle"):
             with Horizontal(id="sidebar"):
                 yield Explorer(self.root)
@@ -1534,7 +1723,7 @@ class AlxEditApp(App):
         sid = sessions.create_session(self.root, label)
         screen = SyncScreen()
         await self.push_screen(screen)
-        files = sessions.iter_tracked_files(self.root)
+        files = sessions.iter_tracked_files(self.root, self._settings)
         total = len(files)
         for index, path in enumerate(files):
             try:
@@ -1598,7 +1787,10 @@ class AlxEditApp(App):
             for mfile in sorted(files_dir.rglob("*")):
                 if not mfile.is_file():
                     continue
-                path = self.root / mfile.relative_to(files_dir)
+                rel = mfile.relative_to(files_dir).as_posix()
+                if not project_settings.should_track(self._settings, rel):
+                    continue  # untracked now: not a tracked deletion
+                path = self.root / rel
                 if path in disk_set or path in self._changes:
                     continue
                 self._changes[path] = ChangeRecord(
@@ -2106,6 +2298,26 @@ class AlxEditApp(App):
         """Top-bar Session button: switch to / create / delete sessions."""
         self._run_modal(self._do_session_pick())
 
+    def action_settings(self) -> None:
+        """Top-bar Settings button: what the session mirror tracks."""
+        self.push_screen(
+            SettingsScreen(self.root, self._settings, self._apply_settings)
+        )
+
+    def _apply_settings(self, new: project_settings.Settings) -> None:
+        """Persist project settings and re-derive what is tracked.
+
+        Takes effect for new sessions immediately; the active session's
+        change list is re-reconciled so newly excluded files settle out
+        of it and newly tracked dot files can appear.
+        """
+        project_settings.save(self.root, new)
+        self._settings = new
+        self._changes.clear()
+        self._init_snapshot()
+        self._reconcile_with_mirror()
+        self._emit_changes()
+
     # --- inline diff ---------------------------------------------------- #
 
     async def show_inline_diff(self, path: Path) -> None:
@@ -2537,7 +2749,7 @@ class AlxEditApp(App):
             pass
 
     def _iter_tracked_files(self) -> list[Path]:
-        return sessions.iter_tracked_files(self.root)
+        return sessions.iter_tracked_files(self.root, self._settings)
 
     def _init_snapshot(self) -> None:
         """Capture the starting state (stat sigs for the change watcher).
@@ -3191,6 +3403,8 @@ class AlxEditApp(App):
             self.action_changes()
         elif button_id == "btn-session":
             self.action_sessions()
+        elif button_id == "btn-settings":
+            self.action_settings()
 
 
 def _same_file(a: Path, b: Path) -> bool:

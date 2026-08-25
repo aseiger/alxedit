@@ -68,14 +68,16 @@ alxedit2 --root ~/src/myproject main.py   # explicit working dir + a file
 | `ctrl+q`        | Quit                            |
 | `f2`            | External changes — **approve or reject** them (see below)|
 | `s`             | Sessions (open / new / delete)  |
+| `ctrl+.`        | Settings — what the mirror tracks (see below) |
 | `f1`            | Help                            |
 
 ## Sessions
 
 Sessions are optional. When alxedit2 starts, if the working directory
 already has a `.alxedit/` folder it offers to open (or create) a **session**
-— a sync of the whole working tree under `.alxedit/<id>/` (a progress bar
-shows while files are copied):
+— a sync of the working tree under `.alxedit/<id>/` (a progress bar
+shows while files are copied; what counts as “tracked” is configurable,
+see [Settings](#settings-alexeditrc)):
 
 ```
 .alxedit/
@@ -106,6 +108,31 @@ copy — not memory, not git.
 Sessions are plain files: inspect them, `cp -r` one to preserve it,
 `rm -rf .alxedit/<id>` to remove one manually. (`.alxedit/` itself is
 excluded from the mirror.)
+
+## Settings (`.alxeditrc`)
+
+The **Settings** button (top bar, or `ctrl+.`) edits the project's
+`.alxeditrc` file — plain text, also hand-editable:
+
+```
+ignore <path>   never mirror/track this file or folder
+track  <path>   mirror/track this dot file/dot folder despite the default
+```
+
+The explorer always shows **every** file in the project; these settings
+control what the session mirror (the diff/revert baseline) actually
+covers:
+
+- regular files and folders are tracked by default;
+- dot files and dot folders (`.env`, `.github/`, …) are **not** tracked
+  unless listed with `track`;
+- `ignore` opts anything out — e.g. a massive image you don't want
+  copied into every session.
+
+Paths are relative to the project root, case-insensitive; a folder entry
+covers everything below it; `ignore` wins over `track`. Changes apply
+immediately (new sessions use them right away; the active session's
+change list is re-reconciled).
 
 ## External change tracking (AI-agent aware)
 

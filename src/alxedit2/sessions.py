@@ -11,9 +11,10 @@ content the user last approved (session start, or the editor's most recent
 save). When alxedit2 saves a file, the mirror copy is updated too, so the
 baseline always tracks the user's latest approval.
 
-Only "tracked" files are mirrored: dot-directories (``.git``, ``.venv``,
-``.alxedit`` itself), ``__pycache__``/``node_modules``, and files larger
-than :data:`MAX_TRACK_BYTES` are skipped.
+Only "tracked" files are mirrored: dot files and dot folders (unless
+explicitly tracked, see :mod:`alxedit2.settings`), files the project
+settings ignore, ``__pycache__``/``node_modules``, and files larger than
+:data:`MAX_TRACK_BYTES` are skipped.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
+
+from alxedit2 import settings as project_settings
 
 #: Name of the per-project session directory.
 SESS_DIR_NAME = ".alxedit"
@@ -166,10 +169,20 @@ def session_label(root: Path, sid: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def iter_tracked_files(root: Path) -> list[Path]:
-    """All mirrorable files under *root* (dot-dirs and big files skipped)."""
+def iter_tracked_files(
+    root: Path, settings: Optional[project_settings.Settings] = None
+) -> list[Path]:
+    """All tracked files under *root*.
+
+    Skipped: the session dir, ``__pycache__``/``node_modules``, files
+    larger than :data:`MAX_TRACK_BYTES`, and anything the project
+    *settings* exclude — dot files/folders unless explicitly tracked,
+    and explicit ``ignore`` entries.
+    """
+    st = settings if settings is not None else project_settings.Settings()
+    root = Path(root)
     out: list[Path] = []
-    stack: list[Path] = [Path(root)]
+    stack: list[Path] = [root]
     while stack:
         directory = stack.pop()
         try:
@@ -177,7 +190,10 @@ def iter_tracked_files(root: Path) -> list[Path]:
         except OSError:
             continue
         for entry in entries:
-            if entry.name.startswith("."):
+            if entry.name == SESS_DIR_NAME:
+                continue
+            rel = entry.relative_to(root).as_posix()
+            if not project_settings.should_track(st, rel):
                 continue
             if entry.is_dir():
                 if entry.name not in IGNORED_DIRS:

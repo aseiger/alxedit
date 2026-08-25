@@ -6,11 +6,19 @@ import shutil
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, ListView, TabPane, TabbedContent, TextArea
+from textual.widgets import (
+    Button,
+    Input,
+    ListView,
+    TabPane,
+    TabbedContent,
+    TextArea,
+)
 
 from alxedit2 import sessions
+from alxedit2 import settings as project_settings
 from alxedit2.__main__ import resolve_root
-from alxedit2.app import AlxEditApp, Explorer, PaneSizer, SessionScreen
+from alxedit2.app import AlxEditApp, Explorer, PaneSizer, SettingsScreen, SessionScreen
 from alxedit2.languages import language_for_path
 
 
@@ -24,7 +32,7 @@ def repo(tmp_path: Path) -> Path:
     (tmp_path / ".hidden").write_text("secret\n")
     (tmp_path / "README.md").write_text("# hi\n")
     sid = sessions.create_session(tmp_path)
-    for f in sessions.iter_tracked_files(tmp_path):
+    for f in sessions.iter_tracked_files(tmp_path, project_settings.load(tmp_path)):
         sessions.copy_to_mirror(tmp_path, sid, f)
     return tmp_path
 
@@ -33,7 +41,7 @@ def _new_session(root: Path) -> str:
     """Create a session mirroring the current tree (what the UI's 'New'
     button does)."""
     sid = sessions.create_session(root)
-    for f in sessions.iter_tracked_files(root):
+    for f in sessions.iter_tracked_files(root, project_settings.load(root)):
         sessions.copy_to_mirror(root, sid, f)
     return sid
 
@@ -2008,3 +2016,137 @@ async def test_help_mentions_unsaved_dot_after_resolution(repo: Path) -> None:
         assert "all decided → editable again" in joined
         assert "● tab = change not in baseline yet" in joined
         assert "ctrl+s commits it" in joined
+
+
+# --------------------------------------------------------------------------- #
+# settings (.alxeditrc): what the session mirror tracks
+# --------------------------------------------------------------------------- #
+
+
+async def test_topbar_settings_button_opens_screen(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.query_one("#btn-settings", Button).press()
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+
+
+async def test_dotfile_changes_not_tracked_by_default(repo: Path) -> None:
+    """Dot files are visible in the explorer but external edits to them
+    are not flagged (the mirror never contains them)."""
+    (repo / ".env").write_text("A=1\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        tree = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(tree.root.children))
+        assert _node_at(tree, repo / ".env") is not None  # still visible
+        (repo / ".env").write_text("A=2\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / ".env" not in app._changes
+
+
+async def test_tracked_dotfile_is_mirrored_and_flagged(repo: Path) -> None:
+    """'track .env' opts it in: it lands in the mirror and external
+    edits to it are reviewable."""
+    (repo / ".env").write_text("A=1\n")
+    project_settings.save(repo, project_settings.Settings(track=(".env",)))
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
+    app = AlxEditApp(root=repo, paths=[repo / ".env"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        sid = app.session_id
+        assert sessions.mirror_exists(repo, sid, repo / ".env")
+        (repo / ".env").write_text("A=2\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / ".env" in app._changes
+        # the inline diff shows the tracked baseline vs the agent's line
+        assert area in app._inline_diff
+        assert "M A=1" in area.text
+
+
+async def test_ignored_file_is_not_mirrored_nor_flagged(repo: Path) -> None:
+    """'ignore' opts any file/folder out: not copied to the mirror, and
+    external edits to it are not flagged."""
+    (repo / "assets").mkdir()
+    (repo / "assets" / "big.png").write_text("fake-image-bytes" * 100)
+    project_settings.save(repo, project_settings.Settings(ignore=("assets",)))
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        sid = app.session_id
+        assert not sessions.mirror_exists(repo, sid, repo / "assets" / "big.png")
+        (repo / "assets" / "big.png").write_text("changed")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / "assets" / "big.png" not in app._changes
+
+
+async def test_ignoring_settles_a_pending_change(repo: Path) -> None:
+    """Turning off tracking for a flagged file removes it from the
+    pending changes (and it is not reported as a tracked deletion)."""
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        (repo / "app.js").write_text("const a = 999;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / "app.js" in app._changes
+        app._apply_settings(project_settings.Settings(ignore=("app.js",)))
+        await pilot.pause()
+        assert repo / "app.js" not in app._changes
+
+
+async def test_settings_screen_edits_apply_and_persist(repo: Path) -> None:
+    """Add/remove rows persist to .alxeditrc immediately and update the
+    app's tracking; Done closes the screen."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.action_settings()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SettingsScreen)
+
+        # add an ignore entry
+        inp = screen.query_one("#settings-path", Input)
+        inp.value = "assets"
+        screen.query_one("#settings-add-ignore", Button).press()
+        await pilot.pause()
+        assert app._settings.ignore == ("assets",)
+        assert project_settings.load(repo).ignore == ("assets",)
+
+        # it now has a remove button; remove it again
+        removes = [
+            b for b in screen.query(Button) if b.id == "settings-remove"
+        ]
+        assert any(b.name == "ignore:0" for b in removes)
+        [b for b in removes if b.name == "ignore:0"][0].press()
+        await pilot.pause()
+        assert app._settings.ignore == ()
+        assert project_settings.load(repo).ignore == ()
+
+        # add a track entry (dot file opt-in)
+        inp.value = ".env"
+        screen.query_one("#settings-add-track", Button).press()
+        await pilot.pause()
+        assert app._settings.track == (".env",)
+        assert project_settings.load(repo).track == (".env",)
+
+        # invalid input is rejected (escapes the root / empty)
+        inp.value = "../outside"
+        screen.query_one("#settings-add-ignore", Button).press()
+        await pilot.pause()
+        assert app._settings.ignore == ()
+
+        # done closes the screen
+        screen.query_one("#settings-done", Button).press()
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
