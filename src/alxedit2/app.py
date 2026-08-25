@@ -313,13 +313,19 @@ class Explorer(DirectoryTree):
     can inspect what a session is baselined against. (Mirror contents
     are never *tracked*: the watcher and reconciler skip ``.alxedit``.)
 
-    Files whose on-disk content differs from the session baseline get a
-    ``+N/-M`` marker (lines added / lines removed).
+    Each entry carries a tracking glyph: ``●`` (accent) when the change
+    tracker covers it, ``○`` (dim) when it does not (dot files by
+    default, ``ignore`` rules in ``.alxeditrc``; folders reflect their
+    contents). Files whose on-disk content differs from the session
+    baseline additionally get a ``+N/-M`` marker (lines added / lines
+    removed).
     """
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {
         "explorer--marker-add",
         "explorer--marker-del",
+        "explorer--tracked",
+        "explorer--untracked",
     }
 
     DEFAULT_CSS = """
@@ -332,6 +338,15 @@ class Explorer(DirectoryTree):
         & > .explorer--marker-del {
             color: $error;
             text-style: bold;
+        }
+
+        & > .explorer--tracked {
+            color: $accent;
+            text-style: bold;
+        }
+
+        & > .explorer--untracked {
+            color: $text-muted;
         }
     }
     """
@@ -353,18 +368,24 @@ class Explorer(DirectoryTree):
         unsaved_paths = getattr(self.app, "_unsaved_paths", None)
         if unsaved_paths and entry.path in unsaved_paths:
             text.stylize("bold #ffa62b")  # mutates in place; returns None
-        markers = getattr(self.app, "_tree_markers", None)
-        if not markers:
-            return text
+        # Tracking glyph: does the change tracker cover this entry?
+        parts: list[tuple[str, str]] = []
+        app = self.app
+        if app is not None and hasattr(app, "_is_tracked_path"):
+            if app._is_tracked_path(entry.path):
+                parts.append(("  ●", "explorer--tracked"))
+            else:
+                parts.append(("  ○", "explorer--untracked"))
+        # Pending-change marker, if any.
+        markers = getattr(app, "_tree_markers", None) or {}
         counts = markers.get(entry.path)
-        if counts is None:
+        if counts is not None:
+            added, removed = counts
+            parts.append((f"  +{added}", "explorer--marker-add"))
+            parts.append((f"/-{removed}", "explorer--marker-del"))
+        if not parts:
             return text
-        added, removed = counts
-        marker_parts = [
-            (f"  +{added}", "explorer--marker-add"),
-            (f"/-{removed}", "explorer--marker-del"),
-        ]
-        marker_len = sum(len(chunk) for chunk, _ in marker_parts)
+        suffix_len = sum(len(chunk) for chunk, _ in parts)
         # The tree paints ~4 cells of guide per depth level in front of the
         # label; budget the rest of the panel (minus a cell of slack).
         depth = 0
@@ -373,14 +394,14 @@ class Explorer(DirectoryTree):
             depth += 1
             ancestor = ancestor.parent
         limit = self.size.width - 4 * depth - 1
-        if limit >= 2 and len(text) + marker_len > limit:
-            keep = limit - marker_len
+        if limit >= 2 and len(text) + suffix_len > limit:
+            keep = limit - suffix_len
             if keep >= 3:
                 text = text[: keep - 1]
                 text.append("…")
             elif keep >= 0:
                 text = Text()
-        for chunk, name in marker_parts:
+        for chunk, name in parts:
             text.append(
                 chunk,
                 self.get_component_rich_style(
@@ -813,6 +834,10 @@ class HelpScreen(ModalScreen[None]):
             "              (ctrl+.): the explorer always shows every\n"
             "              file; 'ignore' excludes any file/folder,\n"
             "              'track' includes dot files (off by default)\n"
+            "Tree glyphs     ● = the change tracker covers this file/folder\n"
+            "                ○ = untracked (dot files by default, or an\n"
+            "                'ignore' rule); folders reflect their contents\n"
+            "                +N/-M = pending external change (green/red)\n"
             "esc / ctrl+d  abandon a review (keeps your side; reviews\n"
             "              appear automatically when an open file\n"
             "              changes outside)\n"
@@ -2913,6 +2938,48 @@ class AlxEditApp(App):
         if self.session_id is None:
             return False
         return sessions.mirror_exists(self.root, self.session_id, path)
+
+    def _is_tracked_path(self, path: Path) -> bool:
+        """Whether the change tracker (the session mirror) covers *path*.
+
+        A file is covered when the project settings allow it (dot files
+        off by default; ``ignore``/``track`` rules in ``.alxeditrc``
+        override). A folder counts as covered when *any* file inside it
+        does. The session store (``.alxedit``) is never covered.
+        """
+        root = self.root.resolve()
+        target = path.resolve()
+        try:
+            rel = target.relative_to(root)
+        except ValueError:
+            return False
+        if rel.parts and rel.parts[0] == sessions.SESS_DIR_NAME:
+            return False
+        if target.is_file():
+            return project_settings.should_track(
+                self._settings, rel.as_posix()
+            )
+        # Folder: covered when any file inside is. Early-exit, with a
+        # bound so a huge untracked tree (node_modules, assets, ...) can
+        # not stall a repaint.
+        limit = 4096
+        try:
+            for i, entry in enumerate(target.rglob("*")):
+                if i >= limit:
+                    return True  # assume a big tree has tracked content
+                if not entry.is_file():
+                    continue
+                try:
+                    erel = entry.relative_to(root)
+                except ValueError:
+                    continue
+                if project_settings.should_track(
+                    self._settings, erel.as_posix()
+                ):
+                    return True
+        except OSError:
+            return True  # tree changed mid-walk; don't block the paint
+        return False
 
     def _refresh_tree_markers(self) -> None:
         """Recompute the explorer's ``+N/-M`` markers and repaint the tree.

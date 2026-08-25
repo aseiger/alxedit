@@ -253,6 +253,57 @@ async def test_explorer_lists_repo_files(repo: Path) -> None:
         assert ".alxedit" in joined
 
 
+async def test_explorer_annotates_tracked_and_untracked(repo: Path) -> None:
+    """Entries show whether the change tracker covers them: ● tracked,
+    ○ untracked; folders reflect their contents."""
+    (repo / ".github").mkdir()
+    (repo / ".github" / "ci.yml").write_text("x")
+    (repo / "assets").mkdir()
+    (repo / "assets" / "big.png").write_text("x")
+
+    def line_for(app: AlxEditApp, name: str) -> str:
+        """The rendered tree line whose label is *name* (tracking glyph and
+        change marker cut off before matching; the 📄/📁 icon and tree
+        guides are ignored), or '' if not visible."""
+        for strip in app.screen._compositor.render_strips(app.screen.size):
+            t = strip.text.rstrip()
+            label = t
+            for cut in ("●", "○", " +", "/-"):
+                i = label.find(cut)
+                if i != -1:
+                    label = label[:i]
+            if label.rstrip().endswith(name):
+                return t
+        return ""
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        tree = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(tree.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        assert "●" in line_for(app, "app.js")  # tracked
+        assert "●" in line_for(app, "src")  # folder holding tracked files
+        assert "●" in line_for(app, "assets")  # folder with a tracked file
+        assert "○" in line_for(app, ".hidden")  # untracked dot file
+        assert "○" in line_for(app, ".alxeditrc")  # untracked dot file
+        assert "○" in line_for(app, ".alxedit")  # the session store is never
+        assert "○" in line_for(app, ".github")  # untracked dot folder
+
+    # a 'track' rule flips the glyph
+    project_settings.save(repo, project_settings.Settings(track=(".hidden",)))
+    app2 = AlxEditApp(root=repo)
+    async with app2.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        tree = app2.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(tree.root.children))
+        for _ in range(10):
+            await pilot.pause()
+        assert "●" in line_for(app2, ".hidden")
+
+
 async def test_open_file_sets_language(repo: Path) -> None:
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
