@@ -395,6 +395,53 @@ async def test_ctrl_click_toggle_tracking(repo: Path) -> None:
         assert not app._is_tracked_path(repo / ".hidden")
         assert " ○" in line_for(".hidden")
 
+        # 5. a folder: Untrack 'src' adds 'ignore src' and flips the
+        #    folder glyph (and everything below it)
+        snode = await find_node(ex, "src")
+        await _ctrl_click_node(pilot, app, ex, snode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore src" in rc()
+        assert not app._is_tracked_path(repo / "src" / "hello.py")
+        assert " ○" in line_for("src")
+
+        # 6. ... and Track brings the folder (and its files) back
+        await _ctrl_click_node(pilot, app, ex, snode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore src" not in rc()
+        assert app._is_tracked_path(repo / "src" / "hello.py")
+        assert " T" in line_for("src")
+
+
+async def test_ctrl_click_menu_on_session_store_is_readonly(repo: Path) -> None:
+    """Ctrl+click an entry inside .alxedit offers no file operations —
+    the baseline copy must not be renamed, deleted, tracked, or created
+    over; only a read-only notice and a way to close."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+        node = next(
+            c
+            for c in ex.root.children
+            if c.data is not None and c.data.path.name == ".alxedit"
+        )
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        buttons = {b.id for b in app.screen.query(Button)}
+        assert buttons == {"menu-cancel"}
+        app.screen.query_one("#menu-cancel", Button).press()
+        await pilot.pause()
+
 
 async def test_open_file_sets_language(repo: Path) -> None:
     app = AlxEditApp(root=repo)
@@ -2241,6 +2288,8 @@ async def test_ignoring_settles_a_pending_change(repo: Path) -> None:
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
+        # the session must be active before _watch_tick will flag anything
+        await _wait_for(pilot, lambda: app.session_id is not None)
         (repo / "app.js").write_text("const a = 999;\n")
         app._watch_tick()
         await pilot.pause()

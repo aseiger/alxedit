@@ -743,6 +743,10 @@ class NodeMenuScreen(ModalScreen[str]):
 
     Dismissed with one of: ``"rename"``, ``"delete"``, ``"new-file"``,
     ``"new-folder"``, ``"track"``, ``"untrack"``, or ``"cancel"``.
+
+    Entries inside the session store (``.alxedit``) are the diff
+    baseline: the menu offers no file operations for them, only a
+    read-only notice and a way to close.
     """
 
     CSS = """
@@ -755,6 +759,11 @@ class NodeMenuScreen(ModalScreen[str]):
     NodeMenuScreen .menu--title {
         padding: 0 2 1 2;
         text-style: bold;
+    }
+    NodeMenuScreen .menu--hint {
+        padding: 0 2 1 2;
+        width: 40;
+        color: $text-muted;
     }
     NodeMenuScreen .menu--buttons {
         height: 3;
@@ -771,21 +780,29 @@ class NodeMenuScreen(ModalScreen[str]):
         self._path = path
         self._is_root = is_root
 
+    def _rel(self) -> tuple | None:
+        """The entry's root-relative parts, or None (no app, outside)."""
+        app = self.app
+        if app is None:
+            return None
+        try:
+            return self._path.resolve().relative_to(app.root.resolve()).parts
+        except ValueError:
+            return None
+
+    def _in_session_store(self) -> bool:
+        parts = self._rel()
+        return bool(parts) and parts[0] == sessions.SESS_DIR_NAME
+
     def _track_toggle(self) -> tuple[str, str] | None:
         """The menu's (label, button id) for Track/Untrack, or None for
         entries that can't be toggled (the project root, the session
         store) or when there is no app."""
-        if self._is_root:
+        if self._is_root or self._in_session_store():
             return None
         app = self.app
         if app is None or not hasattr(app, "_is_tracked_path"):
             return None
-        try:
-            rel = self._path.resolve().relative_to(app.root.resolve())
-        except ValueError:
-            return None
-        if rel.parts and rel.parts[0] == sessions.SESS_DIR_NAME:
-            return None  # the session store is never tracked
         if app._is_tracked_path(self._path):
             return ("Untrack", "menu-untrack")
         return ("Track", "menu-track")
@@ -793,6 +810,17 @@ class NodeMenuScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(classes="menu--box"):
             yield Label(f"{display_path(self._path)}", classes="menu--title")
+            if self._in_session_store():
+                # The baseline copy: mutating it would desynchronize the
+                # session, so no file operations — inspect it in the
+                # editor (read-only) instead.
+                yield Label(
+                    "session store — read-only baseline",
+                    classes="menu--hint",
+                )
+                with Horizontal(classes="menu--buttons"):
+                    yield Button("Close", id="menu-cancel")
+                return
             with Horizontal(classes="menu--buttons"):
                 yield Button("Rename", id="menu-rename")
                 yield Button("Delete", id="menu-delete", disabled=self._is_root)
