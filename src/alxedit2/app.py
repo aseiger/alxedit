@@ -1939,8 +1939,22 @@ class AlxEditApp(App):
     # file actions
     # ------------------------------------------------------------------ #
 
+    def _is_session_store_file(self, path: Path) -> bool:
+        """True if *path* lies inside the ``.alxedit`` session store — i.e.
+        it is part of a session mirror (the diff baseline)."""
+        store = (self.root / sessions.SESS_DIR_NAME).resolve()
+        try:
+            path.resolve().relative_to(store)
+        except ValueError:
+            return False
+        return True
+
     async def open_path(self, path: str | Path) -> TextArea:
-        """Open *path* in a tab, or activate its tab if it is already open."""
+        """Open *path* in a tab, or activate its tab if it is already open.
+
+        Files inside the ``.alxedit`` session store (the mirrors) open
+        read-only — they are the baseline, not editable content.
+        """
         target = Path(path).expanduser().resolve()
         if not target.is_file():
             raise FileNotFoundError(f"not a file: {target}")
@@ -1955,11 +1969,13 @@ class AlxEditApp(App):
         except UnicodeDecodeError as exc:
             raise ValueError(f"not a text file: {target}") from exc
 
+        store_file = self._is_session_store_file(target)
         area = TextArea(
             text=text,
             language=language_for_path(target),
             show_line_numbers=True,
             soft_wrap=False,
+            read_only=store_file,
         )
         self.buffers[area] = Buffer(path=target, saved_text=text)
         await self._add_pane(area, target.name)
@@ -1974,12 +1990,17 @@ class AlxEditApp(App):
         else:
             # No pending change: load the session baseline (mirror). The two
             # indicators fall out — color (buffer != disk) and dot (buffer !=
-            # baseline).
-            if self.session_id is not None:
+            # baseline). (Session-store files have no baseline of their own.)
+            if self.session_id is not None and not store_file:
                 buf.baseline = sessions.read_mirror_text(self.root, self.session_id, target)
         self._recompute_flags(buf, area)
         self._retab(area)
         self._statusbar_refresh()
+        if store_file:
+            self.notify(
+                f"{target.name}: session store — opened read-only",
+                title="Read-only",
+            )
         return area
 
     async def action_new_buffer(self) -> None:
@@ -2176,6 +2197,11 @@ class AlxEditApp(App):
     async def _do_save(self) -> None:
         area = self.active_area
         if area is None:
+            return
+        if area.read_only:
+            self.notify(
+                "opened read-only (session store)", title="Save"
+            )
             return
         buf = self.buffers[area]
         if buf.path is None:

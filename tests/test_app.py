@@ -2153,3 +2153,28 @@ async def test_settings_screen_edits_apply_and_persist(repo: Path) -> None:
         screen.query_one("#settings-done", Button).press()
         await pilot.pause()
         assert not isinstance(app.screen, SettingsScreen)
+
+
+async def test_session_store_files_open_read_only(repo: Path) -> None:
+    """Files under .alxedit/ (the session mirrors, i.e. the diff
+    baseline) open read-only: inspectable, not editable. Plain project
+    files stay editable."""
+    sessions_ = sessions.list_sessions(repo)
+    assert len(sessions_) == 1
+    mirror = repo / ".alxedit" / sessions_[0].id / "files" / "app.js"
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = await app.open_path(mirror)
+        assert area.read_only
+        before = area.text
+        await pilot.press(*list("x"))
+        await pilot.pause()
+        assert area.text == before  # typing is blocked
+        # saving a read-only tab is refused, not a no-op write
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert mirror.read_text() == "const a = 1;\n"
+        # a plain project file stays editable
+        area2 = await app.open_path(repo / "app.js")
+        assert not area2.read_only
