@@ -567,9 +567,12 @@ class Statusbar(Static):
 
         name = buf.path.name if buf.path is not None else "untitled"
         n_ext = len(getattr(app, "_changes", {}))
+        ro = bool(getattr(area, "read_only", False))
         left = root_str + session_str + f" ·  {name}"
         if buf.modified:
             left += " ●"
+        if ro:
+            left += " 🔒"
         if n_ext:
             left += f"  ⚑{n_ext}"
         row, col = area.cursor_location
@@ -583,10 +586,13 @@ class Statusbar(Static):
         out.append(root_str, style="bold")
         out.append(session_str, style="bold")
         # File name colored red/orange while unsaved (buffer != disk); ● marks
-        # a buffer not committed to the session baseline (buffer != mirror).
+        # a buffer not committed to the session baseline (buffer != mirror);
+        # 🔒 marks a read-only tab (session-store file: the baseline).
         out.append(f" ·  {name}", style="bold #ffa62b" if buf.unsaved else "bold")
         if buf.modified:
             out.append(" ●", style="bold #ffa62b")
+        if ro:
+            out.append(" 🔒", style="bold")
         if n_ext:
             out.append(f"  ⚑{n_ext}", style="bold")
         out.append(" " * gap)
