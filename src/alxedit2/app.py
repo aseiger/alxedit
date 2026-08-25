@@ -313,12 +313,13 @@ class Explorer(DirectoryTree):
     can inspect what a session is baselined against. (Mirror contents
     are never *tracked*: the watcher and reconciler skip ``.alxedit``.)
 
-    Each entry carries a tracking glyph: ``●`` (accent) when the change
+    Each entry carries a tracking glyph: ``T`` (accent) when the change
     tracker covers it, ``○`` (dim) when it does not (dot files by
     default, ``ignore`` rules in ``.alxeditrc``; folders reflect their
-    contents). Files whose on-disk content differs from the session
-    baseline additionally get a ``+N/-M`` marker (lines added / lines
-    removed).
+    contents). The glyph is toggled from the control-click menu
+    (Track/Untrack). Files whose on-disk content differs from the
+    session baseline additionally get a ``+N/-M`` marker (lines added /
+    lines removed).
     """
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {
@@ -373,7 +374,7 @@ class Explorer(DirectoryTree):
         app = self.app
         if app is not None and hasattr(app, "_is_tracked_path"):
             if app._is_tracked_path(entry.path):
-                parts.append(("  ●", "explorer--tracked"))
+                parts.append(("  T", "explorer--tracked"))
             else:
                 parts.append(("  ○", "explorer--untracked"))
         # Pending-change marker, if any.
@@ -741,7 +742,7 @@ class NodeMenuScreen(ModalScreen[str]):
     """Context menu for an explorer file or folder (control-click).
 
     Dismissed with one of: ``"rename"``, ``"delete"``, ``"new-file"``,
-    ``"new-folder"``, or ``"cancel"``.
+    ``"new-folder"``, ``"track"``, ``"untrack"``, or ``"cancel"``.
     """
 
     CSS = """
@@ -770,12 +771,35 @@ class NodeMenuScreen(ModalScreen[str]):
         self._path = path
         self._is_root = is_root
 
+    def _track_toggle(self) -> tuple[str, str] | None:
+        """The menu's (label, button id) for Track/Untrack, or None for
+        entries that can't be toggled (the project root, the session
+        store) or when there is no app."""
+        if self._is_root:
+            return None
+        app = self.app
+        if app is None or not hasattr(app, "_is_tracked_path"):
+            return None
+        try:
+            rel = self._path.resolve().relative_to(app.root.resolve())
+        except ValueError:
+            return None
+        if rel.parts and rel.parts[0] == sessions.SESS_DIR_NAME:
+            return None  # the session store is never tracked
+        if app._is_tracked_path(self._path):
+            return ("Untrack", "menu-untrack")
+        return ("Track", "menu-track")
+
     def compose(self) -> ComposeResult:
         with Vertical(classes="menu--box"):
             yield Label(f"{display_path(self._path)}", classes="menu--title")
             with Horizontal(classes="menu--buttons"):
                 yield Button("Rename", id="menu-rename")
                 yield Button("Delete", id="menu-delete", disabled=self._is_root)
+                toggle = self._track_toggle()
+                if toggle is not None:
+                    label, button_id = toggle
+                    yield Button(label, id=button_id)
             with Horizontal(classes="menu--buttons"):
                 yield Button("New file here", id="menu-new-file")
                 yield Button("New folder here", id="menu-new-folder")
@@ -787,6 +811,8 @@ class NodeMenuScreen(ModalScreen[str]):
             "menu-delete": "delete",
             "menu-new-file": "new-file",
             "menu-new-folder": "new-folder",
+            "menu-track": "track",
+            "menu-untrack": "untrack",
         }
         self.dismiss(mapping.get(event.button.id, "cancel"))
 
@@ -817,8 +843,9 @@ class HelpScreen(ModalScreen[None]):
             "ctrl+s        save (save-as if untitled)\n"
             "f4 / ctrl+w   close tab\n"
             "ctrl+q        quit\n"
-            "ctrl+click    file/folder menu — rename, delete, or create\n"
-            "              a new file/folder there (mouse-first)\n"
+            "ctrl+click    file/folder menu — rename, delete, track /\n"
+            "              untrack, or create a new file/folder there\n"
+            "              (mouse-first)\n"
             "ctrl+shift+n  new folder where the cursor is (hotkey)\n"
             "ctrl+shift+x  delete the highlighted folder (hotkey)\n"
             "f2            external changes — approve or reject them\n"
@@ -834,10 +861,11 @@ class HelpScreen(ModalScreen[None]):
             "              (ctrl+.): the explorer always shows every\n"
             "              file; 'ignore' excludes any file/folder,\n"
             "              'track' includes dot files (off by default)\n"
-            "Tree glyphs     ● = the change tracker covers this file/folder\n"
+            "Tree glyphs     T = the change tracker covers this file/folder\n"
             "                ○ = untracked (dot files by default, or an\n"
             "                'ignore' rule); folders reflect their contents\n"
             "                +N/-M = pending external change (green/red)\n"
+            "                ctrl+click an entry: Track / Untrack it\n"
             "esc / ctrl+d  abandon a review (keeps your side; reviews\n"
             "              appear automatically when an open file\n"
             "              changes outside)\n"
@@ -2069,6 +2097,8 @@ class AlxEditApp(App):
             await self._do_node_rename(node)
         elif choice == "delete":
             await self._do_node_delete(node)
+        elif choice in ("track", "untrack"):
+            self._set_tracked(node.data.path, choice == "track")
         elif choice in ("new-file", "new-folder"):
             parent, list_node = self._parent_dir(node)
             if choice == "new-file":
@@ -2368,6 +2398,50 @@ class AlxEditApp(App):
         self._init_snapshot()
         self._reconcile_with_mirror()
         self._emit_changes()
+
+    def _set_tracked(self, path: Path, want: bool) -> None:
+        """Add *path* to (or remove it from) the tracked list.
+
+        Edits ``.alxeditrc``: tracking a dot file/folder adds a
+        ``track`` rule; untracking anything adds an ``ignore`` rule
+        (which wins over everything). The active session's change list
+        is then re-derived — newly excluded files settle out of it,
+        newly included dot files may appear as changes.
+        """
+        try:
+            rel = project_settings.normalize(
+                path.resolve().relative_to(self.root.resolve())
+            )
+        except ValueError:
+            self.notify("outside the project", title="Track")
+            return
+        if not rel:
+            return
+        cur = self._settings
+
+        def _without(entries: tuple, entry: str) -> tuple:
+            return tuple(e for e in entries if e.casefold() != entry.casefold())
+
+        def _add_unique(entries: tuple, entry: str) -> tuple:
+            if any(e.casefold() == entry.casefold() for e in entries):
+                return entries
+            return entries + (entry,)
+
+        if want:
+            ignore = _without(cur.ignore, rel)
+            track = (
+                _add_unique(cur.track, rel)
+                if project_settings.is_dot(rel)
+                else cur.track
+            )
+        else:
+            ignore = _add_unique(cur.ignore, rel)
+            track = _without(cur.track, rel)
+        self._apply_settings(project_settings.Settings(ignore=ignore, track=track))
+        self.notify(
+            ("tracking " if want else "untracking ") + rel,
+            title="Track",
+        )
 
     # --- inline diff ---------------------------------------------------- #
 

@@ -262,16 +262,20 @@ async def test_explorer_annotates_tracked_and_untracked(repo: Path) -> None:
     (repo / "assets" / "big.png").write_text("x")
 
     def line_for(app: AlxEditApp, name: str) -> str:
-        """The rendered tree line whose label is *name* (tracking glyph and
-        change marker cut off before matching; the 📄/📁 icon and tree
-        guides are ignored), or '' if not visible."""
+        """The rendered tree line whose label is *name* (trailing tracking
+        glyph and change marker stripped before matching; the 📄/📁 icon
+        and tree guides are ignored), or '' if not visible."""
         for strip in app.screen._compositor.render_strips(app.screen.size):
             t = strip.text.rstrip()
             label = t
-            for cut in ("●", "○", " +", "/-"):
-                i = label.find(cut)
+            # trailing "+N/-M" change marker, if present
+            if "/-" in label:
+                i = label.rfind(" +")
                 if i != -1:
-                    label = label[:i]
+                    label = label[:i].rstrip()
+            # trailing tracking glyph ("T" or "○"), if present
+            if label.endswith(" T") or label.endswith(" ○"):
+                label = label[:-2].rstrip()
             if label.rstrip().endswith(name):
                 return t
         return ""
@@ -284,13 +288,13 @@ async def test_explorer_annotates_tracked_and_untracked(repo: Path) -> None:
         for _ in range(10):
             await pilot.pause()
 
-        assert "●" in line_for(app, "app.js")  # tracked
-        assert "●" in line_for(app, "src")  # folder holding tracked files
-        assert "●" in line_for(app, "assets")  # folder with a tracked file
-        assert "○" in line_for(app, ".hidden")  # untracked dot file
-        assert "○" in line_for(app, ".alxeditrc")  # untracked dot file
-        assert "○" in line_for(app, ".alxedit")  # the session store is never
-        assert "○" in line_for(app, ".github")  # untracked dot folder
+        assert " T" in line_for(app, "app.js")  # tracked
+        assert " T" in line_for(app, "src")  # folder holding tracked files
+        assert " T" in line_for(app, "assets")  # folder with a tracked file
+        assert " ○" in line_for(app, ".hidden")  # untracked dot file
+        assert " ○" in line_for(app, ".alxeditrc")  # untracked dot file
+        assert " ○" in line_for(app, ".alxedit")  # the session store is never
+        assert " ○" in line_for(app, ".github")  # untracked dot folder
 
     # a 'track' rule flips the glyph
     project_settings.save(repo, project_settings.Settings(track=(".hidden",)))
@@ -301,7 +305,95 @@ async def test_explorer_annotates_tracked_and_untracked(repo: Path) -> None:
         await _wait_for(pilot, lambda: bool(tree.root.children))
         for _ in range(10):
             await pilot.pause()
-        assert "●" in line_for(app2, ".hidden")
+        assert " T" in line_for(app2, ".hidden")
+
+
+async def test_ctrl_click_toggle_tracking(repo: Path) -> None:
+    """Ctrl+click -> Track/Untrack edits .alxeditrc and flips the glyph:
+    untracking adds an ignore rule; tracking a dot file adds a track
+    rule; the menu offers the opposite action on the next open."""
+
+    async def find_node(ex: Explorer, name: str):
+        for _ in range(40):
+            node = next(
+                (c for c in ex.root.children if c.data and c.data.path.name == name),
+                None,
+            )
+            if node is not None:
+                return node
+            await pilot.pause()
+        return None
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        def rc() -> str:
+            return (repo / ".alxeditrc").read_text()
+
+        def line_for(name: str) -> str:
+            for strip in app.screen._compositor.render_strips(app.screen.size):
+                t = strip.text.rstrip()
+                label = t
+                if "/-" in label:
+                    i = label.rfind(" +")
+                    if i != -1:
+                        label = label[:i].rstrip()
+                if label.endswith(" T") or label.endswith(" ○"):
+                    label = label[:-2].rstrip()
+                if label.rstrip().endswith(name):
+                    return t
+            return ""
+
+        # 1. app.js is tracked by default -> the menu offers 'Untrack'
+        node = await find_node(ex, "app.js")
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" in rc()
+        assert not app._is_tracked_path(repo / "app.js")
+        assert " ○" in line_for("app.js")
+
+        # 2. ... and the menu now offers 'Track' again
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" not in rc()
+        assert app._is_tracked_path(repo / "app.js")
+        assert " T" in line_for("app.js")
+
+        # 3. a dot file is untracked by default -> 'Track .hidden' adds
+        #    a track rule
+        hnode = await find_node(ex, ".hidden")
+        await _ctrl_click_node(pilot, app, ex, hnode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "track .hidden" in rc()
+        assert app._is_tracked_path(repo / ".hidden")
+        assert " T" in line_for(".hidden")
+
+        # 4. ... and now 'Untrack' works on it too (ignore wins)
+        await _ctrl_click_node(pilot, app, ex, hnode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore .hidden" in rc()
+        assert not app._is_tracked_path(repo / ".hidden")
+        assert " ○" in line_for(".hidden")
 
 
 async def test_open_file_sets_language(repo: Path) -> None:

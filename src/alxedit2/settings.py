@@ -39,12 +39,12 @@ class Settings:
     track: tuple[str, ...] = ()
 
 
-def normalize(entry: str) -> str:
+def normalize(entry: str | Path) -> str:
     """Canonical form of a path entry: ``/``-separated, no empty/``.``
     parts, no leading ``./`` or trailing slash."""
     parts = [
         part
-        for part in entry.replace("\\", "/").strip().split("/")
+        for part in str(entry).replace("\\", "/").strip().split("/")
         if part not in ("", ".")
     ]
     return "/".join(parts)

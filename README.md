@@ -61,7 +61,7 @@ alxedit2 --root ~/src/myproject main.py   # explicit working dir + a file
 | `ctrl+n`        | New buffer                      |
 | `ctrl+s`        | Save (save-as if untitled)      |
 | `ctrl+shift+s`  | Save as…                        |
-| `ctrl+click` (explorer) | File/folder menu — **Rename**, **Delete**, **New file here**, **New folder here**. Files: "here" = its folder. Folders: "here" = inside them |
+| `ctrl+click` (explorer) | File/folder menu — **Rename**, **Delete**, **Track**/**Untrack** (edit `.alxeditrc`), **New file here**, **New folder here**. Files: "here" = its folder. Folders: "here" = inside them |
 | `ctrl+shift+n`  | New folder where the cursor is (hotkey alternative) |
 | `ctrl+shift+x`  | Delete highlighted folder (hotkey alternative; tracked files inside stay revertable) |
 | `f4` / `ctrl+w` | Close tab                       |
@@ -159,12 +159,15 @@ relative to the session copy (green `+`, red `-`). A file without a
 marker matches the session snapshot exactly; the marker disappears the
 moment the file is saved, approved, or rejected.
 
-Every explorer entry also carries a **tracking glyph**: `●` (accent
+Every explorer entry also carries a **tracking glyph**: `T` (accent
 blue) means the change tracker covers it — it is in the session mirror
 — while `○` (dim) means it is untracked (dot files by default, or an
-`ignore` rule in `.alxeditrc`). Folders reflect their contents: `●`
+`ignore` rule in `.alxeditrc`). Folders reflect their contents: `T`
 when anything inside is tracked, `○` when nothing is. Flip a rule in
-Settings and the glyphs follow.
+Settings — or right from the tree: **ctrl+click an entry and pick
+Track / Untrack** — and the glyphs follow. Untracking adds an `ignore`
+rule; tracking a dot file/folder adds a `track` rule. Both land in
+`.alxeditrc`.
 
 If the file is already open, the tab **immediately switches to a diff
 review** — there is no separate diff window. Both sides are painted into
