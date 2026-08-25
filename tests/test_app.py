@@ -30,6 +30,7 @@ def repo(tmp_path: Path) -> Path:
     (tmp_path / "src" / "hello.py").write_text("def hello():\n    return 'world'\n")
     (tmp_path / "app.js").write_text("const a = 1;\n")
     (tmp_path / ".hidden").write_text("secret\n")
+    (tmp_path / ".alxeditrc").write_text("# no extra rules in the test fixture\n")
     (tmp_path / "README.md").write_text("# hi\n")
     sid = sessions.create_session(tmp_path)
     for f in sessions.iter_tracked_files(tmp_path, project_settings.load(tmp_path)):
@@ -244,10 +245,12 @@ async def test_explorer_lists_repo_files(repo: Path) -> None:
         assert "src" in joined
         assert "app.js" in joined
         assert "README.md" in joined
-        # dotfiles are shown ...
+        # dotfiles are shown, including the project settings file ...
         assert ".hidden" in joined
-        # ... but the session store itself never appears in the tree
-        assert ".alxedit" not in joined
+        assert ".alxeditrc" in joined
+        # ... and the session store itself (the diff baseline, for
+        # inspection) is part of the tree as well
+        assert ".alxedit" in joined
 
 
 async def test_open_file_sets_language(repo: Path) -> None:

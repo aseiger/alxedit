@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, ClassVar, Iterable, Optional
+from typing import Callable, ClassVar, Optional
 
 from rich.style import Style
 from rich.text import Text
@@ -308,7 +308,10 @@ class InlineDiffState:
 class Explorer(DirectoryTree):
     """Directory tree for the working directory.
 
-    Dotfiles are shown, except the session store (``.alxedit``) itself.
+    Every file in the project is shown — dotfiles included, and the
+    session store (``.alxedit/<sid>/``, the diff baseline) too, so you
+    can inspect what a session is baselined against. (Mirror contents
+    are never *tracked*: the watcher and reconciler skip ``.alxedit``.)
 
     Files whose on-disk content differs from the session baseline get a
     ``+N/-M`` marker (lines added / lines removed).
@@ -332,9 +335,6 @@ class Explorer(DirectoryTree):
         }
     }
     """
-
-    def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
-        return [path for path in paths if path.name != sessions.SESS_DIR_NAME]
 
     def render_label(self, node, base_style, style):
         """Node label, plus the ``+added/-removed`` change marker if any.
