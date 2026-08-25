@@ -72,8 +72,10 @@ alxedit2 --root ~/src/myproject main.py   # explicit working dir + a file
 
 ## Sessions
 
-When alxedit2 starts it syncs the whole working tree into a **session**
-under `.alxedit/` (a progress bar shows while files are copied):
+Sessions are optional. When alxedit2 starts, if the working directory
+already has a `.alxedit/` folder it offers to open (or create) a **session**
+— a sync of the whole working tree under `.alxedit/<id>/` (a progress bar
+shows while files are copied):
 
 ```
 .alxedit/
@@ -86,10 +88,14 @@ The mirror is the **baseline** for everything else: diffs against external
 edits, reverts, and the “approved” state all compare against *this session’s*
 copy — not memory, not git.
 
-- **Startup** — if `.alxedit/` already has sessions you get a picker:
-  open an existing one (it re-baselines the diff on that snapshot),
-  create a new one (fresh mirror, with a progress bar), or delete ones you
-  don’t want. With no sessions it just creates one and goes.
+- **Startup** — if the working directory has a `.alxedit/` folder with
+  sessions you get a picker: open an existing one (it re-baselines the diff
+  on that snapshot), create a new one (fresh mirror, with a progress bar),
+  or delete ones you don’t want.
+- **No `.alxedit/` folder? Basic editor mode.** alxedit2 does *not* copy
+  the tree or track changes — it just runs as a plain editor (explorer,
+  tabs, syntax highlighting, save). Use the `s` key / **Session** button to
+  start a session later if you want tracked changes.
 - **`s` key / “Session” button** — the same picker any time, so you can
   start a new baseline mid-run (e.g. “everything the agent did so far is
   fine, start a fresh session for the next round”) or jump back to an
@@ -102,6 +108,9 @@ Sessions are plain files: inspect them, `cp -r` one to preserve it,
 excluded from the mirror.)
 
 ## External change tracking (AI-agent aware)
+
+> Requires an active session — in basic editor mode (no `.alxedit/` folder)
+> there is no baseline, so nothing is tracked.
 
 alxedit2 watches the project tree for changes made **outside** the editor —
 for example an AI agent writing files while you watch. Every 0.8 s the tree

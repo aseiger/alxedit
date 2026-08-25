@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,26 @@ from alxedit2.languages import language_for_path
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
+    """A project directory, including an existing session (the normal state
+    of a folder the user has opened before)."""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "hello.py").write_text("def hello():\n    return 'world'\n")
     (tmp_path / "app.js").write_text("const a = 1;\n")
     (tmp_path / ".hidden").write_text("secret\n")
     (tmp_path / "README.md").write_text("# hi\n")
+    sid = sessions.create_session(tmp_path)
+    for f in sessions.iter_tracked_files(tmp_path):
+        sessions.copy_to_mirror(tmp_path, sid, f)
     return tmp_path
+
+
+def _new_session(root: Path) -> str:
+    """Create a session mirroring the current tree (what the UI's 'New'
+    button does)."""
+    sid = sessions.create_session(root)
+    for f in sessions.iter_tracked_files(root):
+        sessions.copy_to_mirror(root, sid, f)
+    return sid
 
 
 def _mouse_move(app, x: float, y: float) -> None:
@@ -221,8 +236,10 @@ async def test_explorer_lists_repo_files(repo: Path) -> None:
         assert "src" in joined
         assert "app.js" in joined
         assert "README.md" in joined
-        # dotfiles are hidden
-        assert ".hidden" not in joined
+        # dotfiles are shown ...
+        assert ".hidden" in joined
+        # ... but the session store itself never appears in the tree
+        assert ".alxedit" not in joined
 
 
 async def test_open_file_sets_language(repo: Path) -> None:
@@ -386,12 +403,14 @@ def test_sessions_module_create_list_delete(tmp_path: Path) -> None:
     assert [s.id for s in sessions.list_sessions(tmp_path)] == [s2]
 
 
-async def test_startup_creates_session_with_mirror(repo: Path) -> None:
+async def test_startup_activates_existing_session(repo: Path) -> None:
+    """With a .alxedit folder present, startup activates a session."""
+    s0 = sessions.list_sessions(repo)[0].id
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
-        assert app.session_id is not None
-        sdir = repo / ".alxedit" / app.session_id
+        assert app.session_id == s0
+        sdir = repo / ".alxedit" / s0
         assert (sdir / "session.json").is_file()
         assert (
             sdir / "files" / "src" / "hello.py"
@@ -399,6 +418,34 @@ async def test_startup_creates_session_with_mirror(repo: Path) -> None:
         assert (sdir / "files" / "app.js").read_text() == "const a = 1;\n"
         # dotfiles are not mirrored
         assert not (sdir / "files" / ".hidden").exists()
+
+
+async def test_startup_basic_mode_without_alxedit(tmp_path: Path) -> None:
+    """No .alxedit folder -> plain editor: no tree copy, no tracked changes."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "hello.py").write_text("def hello():\n    return 'world'\n")
+    (tmp_path / "app.js").write_text("const a = 1;\n")
+
+    app = AlxEditApp(root=tmp_path, paths=[tmp_path / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert app.session_id is None
+        assert not (tmp_path / ".alxedit").exists()  # nothing was copied
+        assert app.active_area is not None  # the file still opened fine
+        assert app._changes == {}
+
+    # a session can still be started later via the Session button
+    app2 = AlxEditApp(root=tmp_path)
+    async with app2.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app2.action_sessions()
+        await pilot.pause()
+        assert isinstance(app2.screen, SessionScreen)
+        app2.screen.query_one("#sess-new", Button).press()
+        await pilot.pause()
+        assert app2.session_id is not None
+        mirror = tmp_path / ".alxedit" / app2.session_id / "files" / "app.js"
+        assert mirror.read_text() == "const a = 1;\n"
 
 
 async def test_save_updates_session_mirror(repo: Path) -> None:
@@ -420,11 +467,10 @@ def _select_session(screen: SessionScreen, sid: str) -> None:
 
 
 async def test_picker_opens_existing_session(repo: Path) -> None:
-    s1 = sessions.create_session(repo, "first")
-    s2 = sessions.create_session(repo, "second")
-    for f in sessions.iter_tracked_files(repo):
-        sessions.copy_to_mirror(repo, s1, f)
-        sessions.copy_to_mirror(repo, s2, f)
+    # start from a clean slate: drop the fixture's session
+    shutil.rmtree(repo / ".alxedit")
+    s1 = _new_session(repo)
+    s2 = _new_session(repo)
 
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -439,8 +485,10 @@ async def test_picker_opens_existing_session(repo: Path) -> None:
 
 
 async def test_picker_new_session_and_delete(repo: Path) -> None:
-    s1 = sessions.create_session(repo, "first")
-    s2 = sessions.create_session(repo, "second")
+    # start from a clean slate: drop the fixture's session
+    shutil.rmtree(repo / ".alxedit")
+    s1 = _new_session(repo)
+    s2 = _new_session(repo)
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
@@ -1070,6 +1118,11 @@ async def test_change_in_never_expanded_folder_expands_it(repo: Path) -> None:
     hidden = repo / "vault" / "secrets"
     hidden.mkdir(parents=True)
     (hidden / "pass.txt").write_text("hunter2\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         tree = app.query_one(Explorer)
@@ -1222,6 +1275,11 @@ async def test_diff_view_keeps_syntax_highlighting(repo: Path) -> None:
 async def test_diff_kinds_rendered_distinctly(repo: Path) -> None:
     """+ green = addition, ⌫ red strike = deletion, M yellow = modified."""
     (repo / "kinds.txt").write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "kinds.txt"])
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
@@ -1294,6 +1352,11 @@ async def test_save_from_inline_diff_strips_ghost_lines(repo: Path) -> None:
 
 async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1328,6 +1391,11 @@ async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
 async def test_hunk_jump_moves_editor_to_block(repo: Path) -> None:
     """Clicking a hunk's label jumps the editor to that change block."""
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1355,6 +1423,11 @@ async def test_resolved_hunk_leaves_the_list(repo: Path) -> None:
     """A resolved hunk drops off the hunk bar; the remaining hunks' jump
     offsets adapt to the re-rendered view."""
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1389,6 +1462,11 @@ async def test_resolving_a_hunk_advances_to_next_pending(repo: Path) -> None:
     """Resolving a hunk auto-advances the editor to the next pending change."""
     NL = chr(10)
     (repo / "app.js").write_text("one" + NL + "two" + NL + "three" + NL)
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1414,6 +1492,11 @@ async def test_current_hunk_indicator_set_on_jump_cleared_on_scroll(repo: Path) 
     # jump (and the scroll back) really move the viewport.
     base = ["line %03d" % i for i in range(1, 61)]
     (repo / "app.js").write_text(NL.join(base) + NL)
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1460,6 +1543,11 @@ async def test_hunk_all_mine_clean_buffer_no_dot(repo: Path) -> None:
     session baseline (mirror) → no unsaved dot. Saving reverts the disk.
     """
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1499,6 +1587,11 @@ async def test_hunk_all_theirs_commits_to_baseline(repo: Path) -> None:
     immediately: the resolved content becomes the session baseline (mirror),
     the dot clears, and the change settles out of the pending list."""
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1716,6 +1809,9 @@ async def test_delete_folder_removes_directory(repo: Path) -> None:
     victim.mkdir()
     inner = victim / "inner.txt"
     inner.write_text("one\ntwo\n")
+    # track the new folder in the session so its deletion is revertable
+    sid = sessions.list_sessions(repo)[0].id
+    sessions.copy_to_mirror(repo, sid, inner)
 
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -1832,6 +1928,9 @@ async def test_ctrl_click_folder_delete(repo: Path) -> None:
     victim.mkdir()
     inner = victim / "inner.txt"
     inner.write_text("one\ntwo\n")
+    # track the new folder in the session so its deletion is revertable
+    sid = sessions.list_sessions(repo)[0].id
+    sessions.copy_to_mirror(repo, sid, inner)
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         ex = None

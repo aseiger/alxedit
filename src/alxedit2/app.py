@@ -304,7 +304,9 @@ class InlineDiffState:
 
 
 class Explorer(DirectoryTree):
-    """Directory tree for the working directory; dotfiles are hidden.
+    """Directory tree for the working directory.
+
+    Dotfiles are shown, except the session store (``.alxedit``) itself.
 
     Files whose on-disk content differs from the session baseline get a
     ``+N/-M`` marker (lines added / lines removed).
@@ -330,7 +332,7 @@ class Explorer(DirectoryTree):
     """
 
     def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
-        return [path for path in paths if not path.name.startswith(".")]
+        return [path for path in paths if path.name != sessions.SESS_DIR_NAME]
 
     def render_label(self, node, base_style, style):
         """Node label, plus the ``+added/-removed`` change marker if any.
@@ -471,7 +473,7 @@ class HunkBar(Vertical):
 
     DEFAULT_CSS = """
     HunkBar {
-        width: 30;
+        width: 40;
         background: $panel;
         padding: 0 1;
     }
@@ -801,6 +803,10 @@ class HelpScreen(ModalScreen[None]):
             "Session btn   top bar — switch / create / delete sessions\n"
             "              (each session snapshots the folder as the\n"
             "              baseline for diffs & reverts)\n"
+            "              note: without a .alxedit folder alxedit2\n"
+            "              starts as a plain editor — no tree copy,\n"
+            "              no tracked changes. Press this to start\n"
+            "              a session if you want them.\n"
             "esc / ctrl+d  abandon a review (keeps your side; reviews\n"
             "              appear automatically when an open file\n"
             "              changes outside)\n"
@@ -1473,24 +1479,44 @@ class AlxEditApp(App):
         self._run_modal(self._startup())
 
     async def _startup(self) -> None:
-        """Pick (or create) the active session, then open the initial files."""
+        """Set the active session (if any), then open the initial files.
+
+        If the working directory has a ``.alxedit`` folder with sessions,
+        activate one — that session is the baseline for tracked changes.
+        A single session activates straight away; several get a picker
+        (open / new / delete). Without any, alxedit2 runs in **basic
+        editor mode**: no tree copy, no tracked changes. The Session
+        button (top bar) can still start a session at any time.
+        """
         found = sessions.list_sessions(self.root)
         if found:
-            choice = await self.push_screen_wait(
-                SessionScreen(found, starting=True)
-            )
-            if choice.action == "new":
-                sid = await self._create_session(choice.label)
-            elif choice.action == "open" and choice.sid is not None:
-                sid = choice.sid
-            else:  # cancel: fall back to the most recent session
+            if len(found) == 1:
                 sid = found[0].id
+            else:
+                choice = await self.push_screen_wait(
+                    SessionScreen(found, starting=True)
+                )
+                if choice.action == "new":
+                    sid = await self._create_session(choice.label)
+                elif choice.action == "open" and choice.sid is not None:
+                    sid = choice.sid
+                else:  # cancel: fall back to the most recent session
+                    sid = found[0].id
+            if not sessions.session_dir(self.root, sid).is_dir():
+                # e.g. it was deleted while the picker was open
+                sid = await self._create_session(None)
+            self._activate_session(sid)
+            self.notify(
+                f"session: {sessions.session_label(self.root, sid)}",
+                title="Session",
+            )
         else:
-            sid = await self._create_session(None)
-        if not sessions.session_dir(self.root, sid).is_dir():
-            # e.g. it was deleted while the picker was open
-            sid = await self._create_session(None)
-        self._activate_session(sid)
+            # no .alxedit folder: plain editor, no tracked changes
+            self.session_id = None
+            self.notify(
+                "no .alxedit folder — basic editor mode (no tracked changes)",
+                title="Session",
+            )
 
         for path in self.initial_paths:
             try:
@@ -1502,10 +1528,6 @@ class AlxEditApp(App):
         area = self.active_area
         if area is not None:
             area.focus()
-        self.notify(
-            f"session: {sessions.session_label(self.root, sid)}",
-            title="Session",
-        )
 
     async def _create_session(self, label: Optional[str]) -> str:
         """Create a session and mirror the tree into it, with a progress popup."""
@@ -1623,6 +1645,8 @@ class AlxEditApp(App):
     async def _reset_buffers(self) -> None:
         """Close all tabs but one; reset that one to a fresh untitled buffer."""
         areas = list(self._panes)
+        if not areas:
+            return  # empty tab area (basic mode): nothing to reset
         for area in areas[:-1]:
             pane = self._panes.pop(area)
             self.buffers.pop(area, None)
