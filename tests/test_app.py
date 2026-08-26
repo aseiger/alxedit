@@ -421,6 +421,62 @@ async def test_ctrl_click_toggle_tracking(repo: Path) -> None:
         assert " T" in line_for("src")
 
 
+async def test_untracking_a_folder_creates_no_phantom_changes(repo: Path) -> None:
+    """Untracking a folder must not report its files as deletions.
+
+    Regression: ``_init_snapshot`` appended to the previous watcher
+    snapshot instead of replacing it, so the first tick after an Untrack
+    diffed the now-untracked files out of ``seen`` and recorded them as
+    "deleted" changes (phantom records in the change list / status bar).
+    """
+
+    async def find_node(ex: Explorer, name: str):
+        for _ in range(40):
+            node = next(
+                (c for c in ex.root.children if c.data and c.data.path.name == name),
+                None,
+            )
+            if node is not None:
+                return node
+            await pilot.pause()
+        return None
+
+    (repo / "sub").mkdir()
+    (repo / "sub" / "a.txt").write_text("alpha\n")
+    (repo / "sub" / "b.txt").write_text("beta\n")
+    # The fixture session must mirror the folder: the user's scenario is
+    # a session created while the folder was still tracked, then an
+    # Untrack. (A deletion is only offered as a change for files the
+    # session knows about.)
+    sid = sessions.list_sessions(repo)[0].id  # most recent; the app activates it
+    for f in sorted((repo / "sub").rglob("*")):
+        if f.is_file():
+            sessions.copy_to_mirror(repo, sid, f)
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+        snode = await find_node(ex, "sub")
+        await _ctrl_click_node(pilot, app, ex, snode)
+        app.screen.query_one("#menu-untrack", Button).press()
+        for _ in range(15):
+            await pilot.pause()
+        # The first tick after the untrack must not report sub/* as deleted.
+        app._watch_tick()
+        await pilot.pause()
+        assert not app._changes, (
+            f"phantom changes after untrack: {list(app._changes)}"
+        )
+        # Tracking still works outside the ignored folder.
+        (repo / "app.js").write_text("const a = 2;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert (repo / "app.js") in app._changes
+
+
 async def test_shift_click_range_selects_and_bulk_toggles(repo: Path) -> None:
     """shift+click selects a range of entries (✓ marks); ctrl+click then
     opens the bulk menu, and Track/Untrack applies to the whole range in

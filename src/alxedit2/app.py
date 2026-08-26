@@ -3141,13 +3141,20 @@ class AlxEditApp(App):
         """Capture the starting state (stat sigs for the change watcher).
 
         The content baseline lives in the session mirror on disk.
+
+        The snapshot is *replaced*, not extended: entries for files that
+        are no longer tracked (e.g. after Untrack) must disappear, or the
+        next tick would diff them out of ``seen`` and report them as
+        phantom deletions.
         """
+        snap: dict[Path, tuple[int, int]] = {}
         for path in self._iter_tracked_files():
             try:
                 st = path.stat()
             except OSError:
                 continue
-            self._snap[path] = (st.st_size, st.st_mtime_ns)
+            snap[path] = (st.st_size, st.st_mtime_ns)
+        self._snap = snap
 
     def _watch_tick(self) -> None:
         if self.session_id is None:
