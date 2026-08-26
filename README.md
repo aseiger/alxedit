@@ -20,12 +20,13 @@ python3 -m venv .venv
 .venv/bin/alxedit2
 ```
 
-**Global install** (so `alxedit2` is on your `PATH` in any directory):
+**Global install** (so `alxedit2` is on your `PATH` in any directory) —
+from a checkout of this repo:
 
 ```sh
-pipx install /home/alex/devel/alxedit2     # isolated env, recommended
+pipx install .                              # isolated env, recommended
 # — or —
-pip install /home/alex/devel/alxedit2      # into the active environment
+pip install .                               # into the active environment
 ```
 
 After `pipx`, just run `alxedit2` from anywhere.
@@ -33,11 +34,12 @@ After `pipx`, just run `alxedit2` from anywhere.
 ## Usage
 
 ```sh
-alxedit2 [PATHS…] [--root DIR]
+alxedit2 [PATHS…] [--root DIR] [--version]
 ```
 
 - `PATHS` — files to open, and/or a directory to use as the working directory
   (the first directory given becomes the working directory).
+- `--version` — print the version and exit.
 - `--root DIR` — set the working directory explicitly (wins over any
   directory passed in `PATHS`).
 - If no directory is given, the working directory is the current one (`pwd`).
