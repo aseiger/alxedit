@@ -2,25 +2,50 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, ListView, TabPane, TabbedContent, TextArea
+from textual.widgets import (
+    Button,
+    Input,
+    ListView,
+    TabPane,
+    TabbedContent,
+    TextArea,
+)
+from textual.widgets._tabbed_content import ContentTabs
 
 from alxedit2 import sessions
+from alxedit2 import settings as project_settings
 from alxedit2.__main__ import resolve_root
-from alxedit2.app import AlxEditApp, Explorer, PaneSizer, SessionScreen
+from alxedit2.app import AlxEditApp, Explorer, PaneSizer, SettingsScreen, SessionScreen
 from alxedit2.languages import language_for_path
 
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
+    """A project directory, including an existing session (the normal state
+    of a folder the user has opened before)."""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "hello.py").write_text("def hello():\n    return 'world'\n")
     (tmp_path / "app.js").write_text("const a = 1;\n")
     (tmp_path / ".hidden").write_text("secret\n")
+    (tmp_path / ".alxeditrc").write_text("# no extra rules in the test fixture\n")
     (tmp_path / "README.md").write_text("# hi\n")
+    sid = sessions.create_session(tmp_path)
+    for f in sessions.iter_tracked_files(tmp_path, project_settings.load(tmp_path)):
+        sessions.copy_to_mirror(tmp_path, sid, f)
     return tmp_path
+
+
+def _new_session(root: Path) -> str:
+    """Create a session mirroring the current tree (what the UI's 'New'
+    button does)."""
+    sid = sessions.create_session(root)
+    for f in sessions.iter_tracked_files(root, project_settings.load(root)):
+        sessions.copy_to_mirror(root, sid, f)
+    return sid
 
 
 def _mouse_move(app, x: float, y: float) -> None:
@@ -221,8 +246,460 @@ async def test_explorer_lists_repo_files(repo: Path) -> None:
         assert "src" in joined
         assert "app.js" in joined
         assert "README.md" in joined
-        # dotfiles are hidden
-        assert ".hidden" not in joined
+        # dotfiles are shown, including the project settings file ...
+        assert ".hidden" in joined
+        assert ".alxeditrc" in joined
+        # ... and the session store itself (the diff baseline, for
+        # inspection) is part of the tree as well
+        assert ".alxedit" in joined
+
+
+async def test_explorer_annotates_tracked_and_untracked(repo: Path) -> None:
+    """Entries show whether the change tracker covers them: ● tracked,
+    ○ untracked; folders reflect their contents."""
+    (repo / ".github").mkdir()
+    (repo / ".github" / "ci.yml").write_text("x")
+    (repo / "assets").mkdir()
+    (repo / "assets" / "big.png").write_text("x")
+
+    def line_for(app: AlxEditApp, name: str) -> str:
+        """The rendered tree line whose label is *name* (trailing tracking
+        glyph and change marker stripped before matching; the 📄/📁 icon
+        and tree guides are ignored), or '' if not visible."""
+        for strip in app.screen._compositor.render_strips(app.screen.size):
+            t = strip.text.rstrip()
+            label = t
+            # trailing "+N/-M" change marker, if present
+            if "/-" in label:
+                i = label.rfind(" +")
+                if i != -1:
+                    label = label[:i].rstrip()
+            # trailing tracking glyph ("T" or "○"), if present
+            if label.endswith(" T") or label.endswith(" ○"):
+                label = label[:-2].rstrip()
+            if label.rstrip().endswith(name):
+                return t
+        return ""
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        tree = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(tree.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        assert " T" in line_for(app, "app.js")  # tracked
+        assert " T" in line_for(app, "src")  # folder holding tracked files
+        assert " T" in line_for(app, "assets")  # folder with a tracked file
+        assert " ○" in line_for(app, ".hidden")  # untracked dot file
+        assert " ○" in line_for(app, ".alxeditrc")  # untracked dot file
+        assert " ○" in line_for(app, ".alxedit")  # the session store is never
+        assert " ○" in line_for(app, ".github")  # untracked dot folder
+
+    # a 'track' rule flips the glyph
+    project_settings.save(repo, project_settings.Settings(rules=(("track", ".hidden"),)))
+    app2 = AlxEditApp(root=repo)
+    async with app2.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        tree = app2.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(tree.root.children))
+        for _ in range(10):
+            await pilot.pause()
+        assert " T" in line_for(app2, ".hidden")
+
+
+async def test_ctrl_click_toggle_tracking(repo: Path) -> None:
+    """Ctrl+click -> Track/Untrack edits .alxeditrc and flips the glyph:
+    untracking adds an ignore rule; tracking a dot file adds a track
+    rule; the menu offers the opposite action on the next open."""
+
+    async def find_node(ex: Explorer, name: str):
+        for _ in range(40):
+            node = next(
+                (c for c in ex.root.children if c.data and c.data.path.name == name),
+                None,
+            )
+            if node is not None:
+                return node
+            await pilot.pause()
+        return None
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        def rc() -> str:
+            return (repo / ".alxeditrc").read_text()
+
+        def line_for(name: str) -> str:
+            for strip in app.screen._compositor.render_strips(app.screen.size):
+                t = strip.text.rstrip()
+                label = t
+                if "/-" in label:
+                    i = label.rfind(" +")
+                    if i != -1:
+                        label = label[:i].rstrip()
+                if label.endswith(" T") or label.endswith(" ○"):
+                    label = label[:-2].rstrip()
+                if label.rstrip().endswith(name):
+                    return t
+            return ""
+
+        # 1. app.js is tracked by default -> the menu offers 'Untrack'
+        node = await find_node(ex, "app.js")
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" in rc()
+        assert not app._is_tracked_path(repo / "app.js")
+        assert " ○" in line_for("app.js")
+
+        # 2. ... and the menu now offers 'Track' again
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" not in rc()
+        assert app._is_tracked_path(repo / "app.js")
+        assert " T" in line_for("app.js")
+
+        # 3. a dot file is untracked by default -> 'Track .hidden' adds
+        #    a track rule
+        hnode = await find_node(ex, ".hidden")
+        await _ctrl_click_node(pilot, app, ex, hnode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "track .hidden" in rc()
+        assert app._is_tracked_path(repo / ".hidden")
+        assert " T" in line_for(".hidden")
+
+        # 4. ... and now 'Untrack' works on it too (the last rule wins)
+        await _ctrl_click_node(pilot, app, ex, hnode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore .hidden" in rc()
+        assert not app._is_tracked_path(repo / ".hidden")
+        assert " ○" in line_for(".hidden")
+
+        # 5. a folder: Untrack 'src' adds 'ignore src' and flips the
+        #    folder glyph (and everything below it)
+        snode = await find_node(ex, "src")
+        await _ctrl_click_node(pilot, app, ex, snode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore src" in rc()
+        assert not app._is_tracked_path(repo / "src" / "hello.py")
+        assert " ○" in line_for("src")
+
+        # 6. ... and Track brings the folder (and its files) back
+        await _ctrl_click_node(pilot, app, ex, snode)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        app.screen.query_one("#menu-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore src" not in rc()
+        assert app._is_tracked_path(repo / "src" / "hello.py")
+        assert " T" in line_for("src")
+
+
+async def test_untracking_a_folder_creates_no_phantom_changes(repo: Path) -> None:
+    """Untracking a folder must not report its files as deletions.
+
+    Regression: ``_init_snapshot`` appended to the previous watcher
+    snapshot instead of replacing it, so the first tick after an Untrack
+    diffed the now-untracked files out of ``seen`` and recorded them as
+    "deleted" changes (phantom records in the change list / status bar).
+    """
+
+    async def find_node(ex: Explorer, name: str):
+        for _ in range(40):
+            node = next(
+                (c for c in ex.root.children if c.data and c.data.path.name == name),
+                None,
+            )
+            if node is not None:
+                return node
+            await pilot.pause()
+        return None
+
+    (repo / "sub").mkdir()
+    (repo / "sub" / "a.txt").write_text("alpha\n")
+    (repo / "sub" / "b.txt").write_text("beta\n")
+    # The fixture session must mirror the folder: the user's scenario is
+    # a session created while the folder was still tracked, then an
+    # Untrack. (A deletion is only offered as a change for files the
+    # session knows about.)
+    sid = sessions.list_sessions(repo)[0].id  # most recent; the app activates it
+    for f in sorted((repo / "sub").rglob("*")):
+        if f.is_file():
+            sessions.copy_to_mirror(repo, sid, f)
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+        snode = await find_node(ex, "sub")
+        await _ctrl_click_node(pilot, app, ex, snode)
+        app.screen.query_one("#menu-untrack", Button).press()
+        for _ in range(15):
+            await pilot.pause()
+        # The first tick after the untrack must not report sub/* as deleted.
+        app._watch_tick()
+        await pilot.pause()
+        assert not app._changes, (
+            f"phantom changes after untrack: {list(app._changes)}"
+        )
+        # Tracking still works outside the ignored folder.
+        (repo / "app.js").write_text("const a = 2;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert (repo / "app.js") in app._changes
+
+
+async def test_folder_toggle_is_recursive_and_decisive(repo: Path) -> None:
+    """Folder Track/Untrack is recursive and decisive in both directions.
+
+    - a file can be carved back out of an untracked folder;
+    - untracking the folder again overrides that carve-out;
+    - tracking the folder brings back even specifically-ignored children.
+    """
+    app = AlxEditApp(root=repo)
+    async with app.run_test() as pilot:
+        # repo fixture already has src/hello.py; add two more files
+        (repo / "src" / "a.py").write_text("x")
+        (repo / "src" / "b.py").write_text("y")
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        def rc() -> str:
+            return (repo / ".alxeditrc").read_text()
+
+        async def find_node(ex: Explorer, name: str):
+            for _ in range(40):
+                node = next(
+                    (c for c in ex.root.children
+                     if c.data and c.data.path.name == name),
+                    None,
+                )
+                if node is not None:
+                    return node
+                await pilot.pause()
+            return None
+
+        async def press_menu(node, button: str) -> None:
+            await _ctrl_click_node(pilot, app, ex, node)
+            assert app.screen.__class__.__name__ == "NodeMenuScreen"
+            app.screen.query_one(button, Button).press()
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.pause()
+
+        async def src_node():
+            # re-resolved every time — a settings change may rebuild the tree
+            node = await find_node(ex, "src")
+            assert node is not None
+            if not node.children:
+                node.expand()  # lazy tree: children load on expand
+                for _ in range(40):
+                    if node.children:
+                        break
+                    await pilot.pause()
+                assert node.children
+            return node
+
+        async def toggle_src(button: str) -> None:
+            await press_menu(await src_node(), button)
+
+        async def toggle_file(name: str, button: str) -> None:
+            src = await src_node()
+            node = next(
+                c for c in src.children if c.data and c.data.path.name == name
+            )
+            await press_menu(node, button)
+
+        # 1. Untrack the folder — recursive: both files are excluded.
+        await toggle_src("#menu-untrack")
+        assert "ignore src" in rc()
+        assert not app._is_tracked_path(repo / "src" / "a.py")
+        assert not app._is_tracked_path(repo / "src" / "b.py")
+
+        # 2. Carve a file back out of the untracked folder.
+        await toggle_file("a.py", "#menu-track")
+        assert "track src/a.py" in rc()
+        assert app._is_tracked_path(repo / "src" / "a.py")
+        assert not app._is_tracked_path(repo / "src" / "b.py")
+
+        # 3. Untrack the folder again — decisive over the carve-out.
+        await toggle_src("#menu-untrack")
+        assert "track src/a.py" not in rc()
+        assert not app._is_tracked_path(repo / "src" / "a.py")
+        assert not app._is_tracked_path(repo / "src" / "b.py")
+
+        # 4. Track the folder back, exclude every file in it specifically,
+        #    then track the folder again: the folder action brings them
+        #    all back (recursive, decisive).
+        await toggle_src("#menu-track")
+        assert app._is_tracked_path(repo / "src" / "a.py")
+        assert app._is_tracked_path(repo / "src" / "b.py")
+        for name in ("a.py", "b.py", "hello.py"):  # hello.py is from the fixture
+            await toggle_file(name, "#menu-untrack")
+            assert not app._is_tracked_path(repo / "src" / name)
+        await toggle_src("#menu-track")
+        assert "ignore src/a.py" not in rc()
+        assert "ignore src/b.py" not in rc()
+        assert "ignore src/hello.py" not in rc()
+        assert app._is_tracked_path(repo / "src" / "a.py")
+        assert app._is_tracked_path(repo / "src" / "b.py")
+        assert app._is_tracked_path(repo / "src" / "hello.py")
+
+
+async def test_shift_click_range_selects_and_bulk_toggles(repo: Path) -> None:
+    """shift+click selects a range of entries (✓ marks); ctrl+click then
+    opens the bulk menu, and Track/Untrack applies to the whole range in
+    one ``.alxeditrc`` write; a plain click clears the selection."""
+
+    async def find_node(ex: Explorer, name: str):
+        for _ in range(40):
+            node = next(
+                (c for c in ex.root.children if c.data and c.data.path.name == name),
+                None,
+            )
+            if node is not None:
+                return node
+            await pilot.pause()
+        return None
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        def shift_click(node):
+            region = ex._get_label_region(node._line)
+            return pilot.click(
+                Explorer, offset=(region.x + 2, region.y), shift=True
+            )
+
+        def rc() -> str:
+            return (repo / ".alxeditrc").read_text()
+
+        def row_for(name: str) -> str:
+            for strip in app.screen._compositor.render_strips(app.screen.size):
+                t = strip.text.rstrip()
+                if ("📄" in t or "📁" in t) and name in t:
+                    return t
+            return ""
+
+        a = await find_node(ex, "app.js")
+        r = await find_node(ex, "README.md")
+        assert a is not None and r is not None
+
+        # 1. first shift+click: a one-entry selection, marked ✓
+        await shift_click(a)
+        assert app._selection and app._selection[0].name == "app.js"
+        assert "✓" in row_for("app.js")
+
+        # 2. second shift+click: the range from the anchor to here
+        await shift_click(r)
+        names = {p.name for p in app._selection}
+        assert {"app.js", "README.md"} <= names
+        assert len(app._selection) >= 2
+        n = len(app._selection)
+
+        # 3. ctrl+click -> the bulk menu, labelled with the count
+        await _ctrl_click_node(pilot, app, ex, r)
+        assert app.screen.__class__.__name__ == "SelectionMenuScreen"
+        labels = {b.label.plain for b in app.screen.query(Button)}
+        assert f"Track ({n})" in labels
+        assert f"Untrack ({n})" in labels
+
+        # 4. Untrack: one settings write, ignore rules for every
+        #    applicable entry in the range
+        app.screen.query_one("#sel-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" in rc()
+        assert "ignore README.md" in rc()
+        assert not app._is_tracked_path(repo / "app.js")
+        assert not app._is_tracked_path(repo / "README.md")
+        assert "○" in row_for("app.js")
+
+        # 5. the selection is cleared after applying
+        assert app._selection == [] and app._sel_anchor is None
+        assert "✓" not in row_for("app.js")
+
+        # 6. select again and bulk-Track -> the rules come back off
+        await shift_click(a)
+        await shift_click(r)
+        await _ctrl_click_node(pilot, app, ex, r)
+        assert app.screen.__class__.__name__ == "SelectionMenuScreen"
+        app.screen.query_one("#sel-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" not in rc()
+        assert "ignore README.md" not in rc()
+        assert app._is_tracked_path(repo / "app.js")
+        assert app._is_tracked_path(repo / "README.md")
+        assert "T" in row_for("app.js")
+
+        # 7. a plain click drops the selection again
+        await shift_click(a)
+        assert app._selection
+        region = ex._get_label_region(r._line)
+        await pilot.click(Explorer, offset=(region.x + 2, region.y))
+        await pilot.pause()
+        assert app._selection == []
+        assert "✓" not in row_for("app.js")
+
+
+async def test_ctrl_click_menu_on_session_store_is_readonly(repo: Path) -> None:
+    """Ctrl+click an entry inside .alxedit offers no file operations —
+    the baseline copy must not be renamed, deleted, tracked, or created
+    over; only a read-only notice and a way to close."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+        node = next(
+            c
+            for c in ex.root.children
+            if c.data is not None and c.data.path.name == ".alxedit"
+        )
+        await _ctrl_click_node(pilot, app, ex, node)
+        assert app.screen.__class__.__name__ == "NodeMenuScreen"
+        buttons = {b.id for b in app.screen.query(Button)}
+        assert buttons == {"menu-cancel"}
+        app.screen.query_one("#menu-cancel", Button).press()
+        await pilot.pause()
 
 
 async def test_open_file_sets_language(repo: Path) -> None:
@@ -386,12 +863,14 @@ def test_sessions_module_create_list_delete(tmp_path: Path) -> None:
     assert [s.id for s in sessions.list_sessions(tmp_path)] == [s2]
 
 
-async def test_startup_creates_session_with_mirror(repo: Path) -> None:
+async def test_startup_activates_existing_session(repo: Path) -> None:
+    """With a .alxedit folder present, startup activates a session."""
+    s0 = sessions.list_sessions(repo)[0].id
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
-        assert app.session_id is not None
-        sdir = repo / ".alxedit" / app.session_id
+        assert app.session_id == s0
+        sdir = repo / ".alxedit" / s0
         assert (sdir / "session.json").is_file()
         assert (
             sdir / "files" / "src" / "hello.py"
@@ -399,6 +878,34 @@ async def test_startup_creates_session_with_mirror(repo: Path) -> None:
         assert (sdir / "files" / "app.js").read_text() == "const a = 1;\n"
         # dotfiles are not mirrored
         assert not (sdir / "files" / ".hidden").exists()
+
+
+async def test_startup_basic_mode_without_alxedit(tmp_path: Path) -> None:
+    """No .alxedit folder -> plain editor: no tree copy, no tracked changes."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "hello.py").write_text("def hello():\n    return 'world'\n")
+    (tmp_path / "app.js").write_text("const a = 1;\n")
+
+    app = AlxEditApp(root=tmp_path, paths=[tmp_path / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        assert app.session_id is None
+        assert not (tmp_path / ".alxedit").exists()  # nothing was copied
+        assert app.active_area is not None  # the file still opened fine
+        assert app._changes == {}
+
+    # a session can still be started later via the Session button
+    app2 = AlxEditApp(root=tmp_path)
+    async with app2.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app2.action_sessions()
+        await pilot.pause()
+        assert isinstance(app2.screen, SessionScreen)
+        app2.screen.query_one("#sess-new", Button).press()
+        await pilot.pause()
+        assert app2.session_id is not None
+        mirror = tmp_path / ".alxedit" / app2.session_id / "files" / "app.js"
+        assert mirror.read_text() == "const a = 1;\n"
 
 
 async def test_save_updates_session_mirror(repo: Path) -> None:
@@ -420,11 +927,10 @@ def _select_session(screen: SessionScreen, sid: str) -> None:
 
 
 async def test_picker_opens_existing_session(repo: Path) -> None:
-    s1 = sessions.create_session(repo, "first")
-    s2 = sessions.create_session(repo, "second")
-    for f in sessions.iter_tracked_files(repo):
-        sessions.copy_to_mirror(repo, s1, f)
-        sessions.copy_to_mirror(repo, s2, f)
+    # start from a clean slate: drop the fixture's session
+    shutil.rmtree(repo / ".alxedit")
+    s1 = _new_session(repo)
+    s2 = _new_session(repo)
 
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -439,8 +945,10 @@ async def test_picker_opens_existing_session(repo: Path) -> None:
 
 
 async def test_picker_new_session_and_delete(repo: Path) -> None:
-    s1 = sessions.create_session(repo, "first")
-    s2 = sessions.create_session(repo, "second")
+    # start from a clean slate: drop the fixture's session
+    shutil.rmtree(repo / ".alxedit")
+    s1 = _new_session(repo)
+    s2 = _new_session(repo)
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
@@ -518,6 +1026,118 @@ async def test_cannot_delete_active_session(repo: Path) -> None:
         screen.query_one("#sess-cancel", Button).press()
         await pilot.pause()
         assert app.session_id == active
+
+
+async def test_session_picker_shows_diff_summary(repo: Path) -> None:
+    """Each picker row summarizes the working tree vs. that baseline."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        assert app.session_id is not None
+
+        def text() -> str:
+            return "\n".join(
+                strip.text.rstrip()
+                for strip in app.screen._compositor.render_strips(app.screen.size)
+            )
+
+        # in sync: the (only) session matches the tree exactly
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        assert "in sync" in text()
+        app.screen.query_one("#sess-cancel", Button).press()
+        await pilot.pause()
+
+        # one tracked change: a line replaced by two lines -> +2/-1
+        (repo / "src" / "hello.py").write_text(
+            "def hello():\n    return 'bye'\n    # extra\n"
+        )
+        app._watch_tick()
+        assert await _wait_for(pilot, lambda: bool(app._changes))
+
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        t = text()
+        assert "+2" in t
+        assert "/-1" in t
+        assert "in sync" not in t
+
+
+async def test_explorer_refreshes_on_session_create_and_delete(repo: Path) -> None:
+    """The explorer picks up .alxedit/<sid> when a session is created and
+    drops it when one is deleted — no manual tree refresh needed."""
+
+    async def store_children(ex):
+        """The loaded child names of the .alxedit folder (expanding it)."""
+        node = next(
+            (
+                c
+                for c in ex.root.children
+                if c.data is not None and c.data.path.name == ".alxedit"
+            ),
+            None,
+        )
+        if node is None:
+            return set()
+        if not node.children:
+            node.expand()
+            if not await _wait_for(pilot, lambda: bool(node.children), tries=20):
+                return set()
+        return {c.data.path.name for c in node.children if c.data is not None}
+
+    async def wait_kids(want: set) -> bool:
+        """Retry until the store's children cover *want* — the tree
+        reloads asynchronously after a session create/delete, so a single
+        read can land mid-reload (empty children)."""
+        for _ in range(60):
+            if want <= await store_children(ex):
+                return True
+            await pilot.pause()
+        return want <= await store_children(ex)
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        s0 = app.session_id
+        assert s0 is not None  # the fixture session auto-activates
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+
+        # 1. create a session from the Session screen: the explorer picks
+        #    up .alxedit/<s1> on its own
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        app.screen.query_one("#sess-new", Button).press()
+        await _wait_for(
+            pilot,
+            lambda: app.session_id is not None and app.session_id != s0,
+            tries=60,
+        )
+        s1 = app.session_id
+        assert await wait_kids({s0, s1})
+
+        # 2. delete s0 (not the active one): it leaves the explorer too
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        _select_session(app.screen, s0)
+        app.screen.query_one("#sess-delete", Button).press()
+        app.screen.query_one("#sess-delete", Button).press()
+        await pilot.pause()
+        assert not (repo / ".alxedit" / s0).exists()
+        app.screen.query_one("#sess-cancel", Button).press()
+        await pilot.pause()
+        kids: set = set()
+        for _ in range(60):
+            kids = await store_children(ex)
+            if s1 in kids and s0 not in kids:
+                break
+            await pilot.pause()
+        assert s1 in kids
+        assert s0 not in kids
 
 
 # --------------------------------------------------------------------------- #
@@ -1070,6 +1690,11 @@ async def test_change_in_never_expanded_folder_expands_it(repo: Path) -> None:
     hidden = repo / "vault" / "secrets"
     hidden.mkdir(parents=True)
     (hidden / "pass.txt").write_text("hunter2\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         tree = app.query_one(Explorer)
@@ -1222,6 +1847,11 @@ async def test_diff_view_keeps_syntax_highlighting(repo: Path) -> None:
 async def test_diff_kinds_rendered_distinctly(repo: Path) -> None:
     """+ green = addition, ⌫ red strike = deletion, M yellow = modified."""
     (repo / "kinds.txt").write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "kinds.txt"])
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
@@ -1294,6 +1924,11 @@ async def test_save_from_inline_diff_strips_ghost_lines(repo: Path) -> None:
 
 async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1328,6 +1963,11 @@ async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
 async def test_hunk_jump_moves_editor_to_block(repo: Path) -> None:
     """Clicking a hunk's label jumps the editor to that change block."""
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1355,6 +1995,11 @@ async def test_resolved_hunk_leaves_the_list(repo: Path) -> None:
     """A resolved hunk drops off the hunk bar; the remaining hunks' jump
     offsets adapt to the re-rendered view."""
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1389,6 +2034,11 @@ async def test_resolving_a_hunk_advances_to_next_pending(repo: Path) -> None:
     """Resolving a hunk auto-advances the editor to the next pending change."""
     NL = chr(10)
     (repo / "app.js").write_text("one" + NL + "two" + NL + "three" + NL)
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1414,6 +2064,11 @@ async def test_current_hunk_indicator_set_on_jump_cleared_on_scroll(repo: Path) 
     # jump (and the scroll back) really move the viewport.
     base = ["line %03d" % i for i in range(1, 61)]
     (repo / "app.js").write_text(NL.join(base) + NL)
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1460,6 +2115,11 @@ async def test_hunk_all_mine_clean_buffer_no_dot(repo: Path) -> None:
     session baseline (mirror) → no unsaved dot. Saving reverts the disk.
     """
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1499,6 +2159,11 @@ async def test_hunk_all_theirs_commits_to_baseline(repo: Path) -> None:
     immediately: the resolved content becomes the session baseline (mirror),
     the dot clears, and the change settles out of the pending list."""
     (repo / "app.js").write_text("one\ntwo\nthree\n")
+    # fresh baseline: the fixture's session predates this test's setup,
+    # so re-mirror the current disk state (a single session -> it
+    # activates straight away at startup)
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / "app.js"])
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -1716,6 +2381,9 @@ async def test_delete_folder_removes_directory(repo: Path) -> None:
     victim.mkdir()
     inner = victim / "inner.txt"
     inner.write_text("one\ntwo\n")
+    # track the new folder in the session so its deletion is revertable
+    sid = sessions.list_sessions(repo)[0].id
+    sessions.copy_to_mirror(repo, sid, inner)
 
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -1832,6 +2500,9 @@ async def test_ctrl_click_folder_delete(repo: Path) -> None:
     victim.mkdir()
     inner = victim / "inner.txt"
     inner.write_text("one\ntwo\n")
+    # track the new folder in the session so its deletion is revertable
+    sid = sessions.list_sessions(repo)[0].id
+    sessions.copy_to_mirror(repo, sid, inner)
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         ex = None
@@ -1909,3 +2580,170 @@ async def test_help_mentions_unsaved_dot_after_resolution(repo: Path) -> None:
         assert "all decided → editable again" in joined
         assert "● tab = change not in baseline yet" in joined
         assert "ctrl+s commits it" in joined
+
+
+# --------------------------------------------------------------------------- #
+# settings (.alxeditrc): what the session mirror tracks
+# --------------------------------------------------------------------------- #
+
+
+async def test_topbar_settings_button_opens_screen(repo: Path) -> None:
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.query_one("#btn-settings", Button).press()
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+
+
+async def test_dotfile_changes_not_tracked_by_default(repo: Path) -> None:
+    """Dot files are visible in the explorer but external edits to them
+    are not flagged (the mirror never contains them)."""
+    (repo / ".env").write_text("A=1\n")
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        tree = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(tree.root.children))
+        assert _node_at(tree, repo / ".env") is not None  # still visible
+        (repo / ".env").write_text("A=2\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / ".env" not in app._changes
+
+
+async def test_tracked_dotfile_is_mirrored_and_flagged(repo: Path) -> None:
+    """'track .env' opts it in: it lands in the mirror and external
+    edits to it are reviewable."""
+    (repo / ".env").write_text("A=1\n")
+    project_settings.save(repo, project_settings.Settings(rules=(("track", ".env"),)))
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
+    app = AlxEditApp(root=repo, paths=[repo / ".env"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = app.active_area
+        sid = app.session_id
+        assert sessions.mirror_exists(repo, sid, repo / ".env")
+        (repo / ".env").write_text("A=2\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / ".env" in app._changes
+        # the inline diff shows the tracked baseline vs the agent's line
+        assert area in app._inline_diff
+        assert "M A=1" in area.text
+
+
+async def test_ignored_file_is_not_mirrored_nor_flagged(repo: Path) -> None:
+    """'ignore' opts any file/folder out: not copied to the mirror, and
+    external edits to it are not flagged."""
+    (repo / "assets").mkdir()
+    (repo / "assets" / "big.png").write_text("fake-image-bytes" * 100)
+    project_settings.save(repo, project_settings.Settings(rules=(("ignore", "assets"),)))
+    shutil.rmtree(repo / ".alxedit")
+    _new_session(repo)
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        sid = app.session_id
+        assert not sessions.mirror_exists(repo, sid, repo / "assets" / "big.png")
+        (repo / "assets" / "big.png").write_text("changed")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / "assets" / "big.png" not in app._changes
+
+
+async def test_ignoring_settles_a_pending_change(repo: Path) -> None:
+    """Turning off tracking for a flagged file removes it from the
+    pending changes (and it is not reported as a tracked deletion)."""
+    app = AlxEditApp(root=repo, paths=[repo / "app.js"])
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        # the session must be active before _watch_tick will flag anything
+        await _wait_for(pilot, lambda: app.session_id is not None)
+        (repo / "app.js").write_text("const a = 999;\n")
+        app._watch_tick()
+        await pilot.pause()
+        assert repo / "app.js" in app._changes
+        app._apply_settings(project_settings.Settings(rules=(("ignore", "app.js"),)))
+        await pilot.pause()
+        assert repo / "app.js" not in app._changes
+
+
+async def test_settings_screen_edits_apply_and_persist(repo: Path) -> None:
+    """Add/remove rows persist to .alxeditrc immediately and update the
+    app's tracking; Done closes the screen."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        app.action_settings()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SettingsScreen)
+
+        # add an ignore entry
+        inp = screen.query_one("#settings-path", Input)
+        inp.value = "assets"
+        screen.query_one("#settings-add-ignore", Button).press()
+        await pilot.pause()
+        assert app._settings.ignore == ("assets",)
+        assert project_settings.load(repo).ignore == ("assets",)
+
+        # it now has a remove button; remove it again
+        removes = [
+            b for b in screen.query(Button) if b.id == "settings-remove"
+        ]
+        assert any(b.name == "ignore:0" for b in removes)
+        [b for b in removes if b.name == "ignore:0"][0].press()
+        await pilot.pause()
+        assert app._settings.ignore == ()
+        assert project_settings.load(repo).ignore == ()
+
+        # add a track entry (dot file opt-in)
+        inp.value = ".env"
+        screen.query_one("#settings-add-track", Button).press()
+        await pilot.pause()
+        assert app._settings.track == (".env",)
+        assert project_settings.load(repo).track == (".env",)
+
+        # invalid input is rejected (escapes the root / empty)
+        inp.value = "../outside"
+        screen.query_one("#settings-add-ignore", Button).press()
+        await pilot.pause()
+        assert app._settings.ignore == ()
+
+        # done closes the screen
+        screen.query_one("#settings-done", Button).press()
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+
+
+async def test_session_store_files_open_read_only(repo: Path) -> None:
+    """Files under .alxedit/ (the session mirrors, i.e. the diff
+    baseline) open read-only: inspectable, not editable. Plain project
+    files stay editable."""
+    sessions_ = sessions.list_sessions(repo)
+    assert len(sessions_) == 1
+    mirror = repo / ".alxedit" / sessions_[0].id / "files" / "app.js"
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        area = await app.open_path(mirror)
+        assert area.read_only
+        # the tab carries a lock mark
+        tabs = app._tabbed.get_child_by_type(ContentTabs)
+        label = tabs.get_content_tab(app._panes[area].id).label
+        assert "🔒" in label.plain
+        before = area.text
+        await pilot.press(*list("x"))
+        await pilot.pause()
+        assert area.text == before  # typing is blocked
+        # saving a read-only tab is refused, not a no-op write
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert mirror.read_text() == "const a = 1;\n"
+        # a plain project file stays editable, and has no lock mark
+        area2 = await app.open_path(repo / "app.js")
+        assert not area2.read_only
+        label2 = tabs.get_content_tab(app._panes[area2].id).label
+        assert "🔒" not in label2.plain

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, ClassVar, Iterable, Optional
+from typing import Callable, ClassVar, Optional
 
 from rich.style import Style
 from rich.text import Text
@@ -21,6 +21,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
+from textual.widget import Widget
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
@@ -42,6 +43,7 @@ from textual.widgets._tabbed_content import ContentTabs
 from textual._text_area_theme import TextAreaTheme
 
 from . import sessions
+from . import settings as project_settings
 from .languages import language_for_path
 
 
@@ -304,15 +306,28 @@ class InlineDiffState:
 
 
 class Explorer(DirectoryTree):
-    """Directory tree for the working directory; dotfiles are hidden.
+    """Directory tree for the working directory.
 
-    Files whose on-disk content differs from the session baseline get a
-    ``+N/-M`` marker (lines added / lines removed).
+    Every file in the project is shown — dotfiles included, and the
+    session store (``.alxedit/<sid>/``, the diff baseline) too, so you
+    can inspect what a session is baselined against. (Mirror contents
+    are never *tracked*: the watcher and reconciler skip ``.alxedit``.)
+
+    Each entry carries a tracking glyph: ``T`` (accent) when the change
+    tracker covers it, ``○`` (dim) when it does not (dot files by
+    default, ``ignore`` rules in ``.alxeditrc``; folders reflect their
+    contents). The glyph is toggled from the control-click menu
+    (Track/Untrack). Files whose on-disk content differs from the
+    session baseline additionally get a ``+N/-M`` marker (lines added /
+    lines removed).
     """
 
     COMPONENT_CLASSES: ClassVar[set[str]] = {
         "explorer--marker-add",
         "explorer--marker-del",
+        "explorer--tracked",
+        "explorer--untracked",
+        "explorer--selected",
     }
 
     DEFAULT_CSS = """
@@ -326,11 +341,22 @@ class Explorer(DirectoryTree):
             color: $error;
             text-style: bold;
         }
+
+        & > .explorer--tracked {
+            color: $accent;
+            text-style: bold;
+        }
+
+        & > .explorer--untracked {
+            color: $text-muted;
+        }
+
+        & > .explorer--selected {
+            color: $accent;
+            text-style: bold underline;
+        }
     }
     """
-
-    def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
-        return [path for path in paths if not path.name.startswith(".")]
 
     def render_label(self, node, base_style, style):
         """Node label, plus the ``+added/-removed`` change marker if any.
@@ -349,18 +375,26 @@ class Explorer(DirectoryTree):
         unsaved_paths = getattr(self.app, "_unsaved_paths", None)
         if unsaved_paths and entry.path in unsaved_paths:
             text.stylize("bold #ffa62b")  # mutates in place; returns None
-        markers = getattr(self.app, "_tree_markers", None)
-        if not markers:
-            return text
+        # Selection mark (shift+click range), then the tracking glyph.
+        parts: list[tuple[str, str]] = []
+        app = self.app
+        if app is not None and entry.path in getattr(app, "_selection", ()):
+            parts.append(("  ✓", "explorer--selected"))
+        if app is not None and hasattr(app, "_is_tracked_path"):
+            if app._is_tracked_path(entry.path):
+                parts.append(("  T", "explorer--tracked"))
+            else:
+                parts.append(("  ○", "explorer--untracked"))
+        # Pending-change marker, if any.
+        markers = getattr(app, "_tree_markers", None) or {}
         counts = markers.get(entry.path)
-        if counts is None:
+        if counts is not None:
+            added, removed = counts
+            parts.append((f"  +{added}", "explorer--marker-add"))
+            parts.append((f"/-{removed}", "explorer--marker-del"))
+        if not parts:
             return text
-        added, removed = counts
-        marker_parts = [
-            (f"  +{added}", "explorer--marker-add"),
-            (f"/-{removed}", "explorer--marker-del"),
-        ]
-        marker_len = sum(len(chunk) for chunk, _ in marker_parts)
+        suffix_len = sum(len(chunk) for chunk, _ in parts)
         # The tree paints ~4 cells of guide per depth level in front of the
         # label; budget the rest of the panel (minus a cell of slack).
         depth = 0
@@ -369,14 +403,14 @@ class Explorer(DirectoryTree):
             depth += 1
             ancestor = ancestor.parent
         limit = self.size.width - 4 * depth - 1
-        if limit >= 2 and len(text) + marker_len > limit:
-            keep = limit - marker_len
+        if limit >= 2 and len(text) + suffix_len > limit:
+            keep = limit - suffix_len
             if keep >= 3:
                 text = text[: keep - 1]
                 text.append("…")
             elif keep >= 0:
                 text = Text()
-        for chunk, name in marker_parts:
+        for chunk, name in parts:
             text.append(
                 chunk,
                 self.get_component_rich_style(
@@ -386,19 +420,35 @@ class Explorer(DirectoryTree):
         return text
 
     async def _on_click(self, event: events.Click) -> None:
-        """Control-click opens the node's context menu (rename / delete /
-        new file / new folder) instead of the tree's select/expand.
+        """Mouse actions on explorer entries.
+
+        - plain click: clear any range selection, then the tree's normal
+          select/expand/open behavior (falls through to DirectoryTree);
+        - shift+click: set/extend the selection range (last clicked
+          entry → this one) — for the bulk Track/Untrack menu;
+        - ctrl+click: the node's context menu (rename / delete / track /
+          untrack / new file / new folder), or the bulk menu when a
+          range of two or more entries is selected.
 
         Textual dispatches ``_on_click`` up the whole MRO, so ours runs
         before DirectoryTree's; ``prevent_default`` stops the walk so the
         tree's select/expand (and the file open) never happens.
-        Plain clicks fall through to the tree's own handler.
         """
         if event.ctrl:
             event.prevent_default()
             node = self.get_node_at_line(event.style.meta.get("line", -1))
             if node is not None:
-                self.app.action_node_menu(node)
+                if len(self.app._selection) > 1:
+                    self.app.action_selection_menu()
+                else:
+                    self.app.action_node_menu(node)
+        elif event.shift:
+            event.prevent_default()
+            node = self.get_node_at_line(event.style.meta.get("line", -1))
+            if node is not None:
+                self.app._select_range(node)
+        else:
+            self.app._clear_selection()
 
 
 def display_path(path: Path) -> str:
@@ -471,7 +521,7 @@ class HunkBar(Vertical):
 
     DEFAULT_CSS = """
     HunkBar {
-        width: 30;
+        width: 40;
         background: $panel;
         padding: 0 1;
     }
@@ -541,9 +591,12 @@ class Statusbar(Static):
 
         name = buf.path.name if buf.path is not None else "untitled"
         n_ext = len(getattr(app, "_changes", {}))
+        ro = bool(getattr(area, "read_only", False))
         left = root_str + session_str + f" ·  {name}"
         if buf.modified:
             left += " ●"
+        if ro:
+            left += " 🔒"
         if n_ext:
             left += f"  ⚑{n_ext}"
         row, col = area.cursor_location
@@ -557,10 +610,13 @@ class Statusbar(Static):
         out.append(root_str, style="bold")
         out.append(session_str, style="bold")
         # File name colored red/orange while unsaved (buffer != disk); ● marks
-        # a buffer not committed to the session baseline (buffer != mirror).
+        # a buffer not committed to the session baseline (buffer != mirror);
+        # 🔒 marks a read-only tab (session-store file: the baseline).
         out.append(f" ·  {name}", style="bold #ffa62b" if buf.unsaved else "bold")
         if buf.modified:
             out.append(" ●", style="bold #ffa62b")
+        if ro:
+            out.append(" 🔒", style="bold")
         if n_ext:
             out.append(f"  ⚑{n_ext}", style="bold")
         out.append(" " * gap)
@@ -716,7 +772,11 @@ class NodeMenuScreen(ModalScreen[str]):
     """Context menu for an explorer file or folder (control-click).
 
     Dismissed with one of: ``"rename"``, ``"delete"``, ``"new-file"``,
-    ``"new-folder"``, or ``"cancel"``.
+    ``"new-folder"``, ``"track"``, ``"untrack"``, or ``"cancel"``.
+
+    Entries inside the session store (``.alxedit``) are the diff
+    baseline: the menu offers no file operations for them, only a
+    read-only notice and a way to close.
     """
 
     CSS = """
@@ -729,6 +789,11 @@ class NodeMenuScreen(ModalScreen[str]):
     NodeMenuScreen .menu--title {
         padding: 0 2 1 2;
         text-style: bold;
+    }
+    NodeMenuScreen .menu--hint {
+        padding: 0 2 1 2;
+        width: 40;
+        color: $text-muted;
     }
     NodeMenuScreen .menu--buttons {
         height: 3;
@@ -745,12 +810,54 @@ class NodeMenuScreen(ModalScreen[str]):
         self._path = path
         self._is_root = is_root
 
+    def _rel(self) -> tuple | None:
+        """The entry's root-relative parts, or None (no app, outside)."""
+        app = self.app
+        if app is None:
+            return None
+        try:
+            return self._path.resolve().relative_to(app.root.resolve()).parts
+        except ValueError:
+            return None
+
+    def _in_session_store(self) -> bool:
+        parts = self._rel()
+        return bool(parts) and parts[0] == sessions.SESS_DIR_NAME
+
+    def _track_toggle(self) -> tuple[str, str] | None:
+        """The menu's (label, button id) for Track/Untrack, or None for
+        entries that can't be toggled (the project root, the session
+        store) or when there is no app."""
+        if self._is_root or self._in_session_store():
+            return None
+        app = self.app
+        if app is None or not hasattr(app, "_is_tracked_path"):
+            return None
+        if app._is_tracked_path(self._path):
+            return ("Untrack", "menu-untrack")
+        return ("Track", "menu-track")
+
     def compose(self) -> ComposeResult:
         with Vertical(classes="menu--box"):
             yield Label(f"{display_path(self._path)}", classes="menu--title")
+            if self._in_session_store():
+                # The baseline copy: mutating it would desynchronize the
+                # session, so no file operations — inspect it in the
+                # editor (read-only) instead.
+                yield Label(
+                    "session store — read-only baseline",
+                    classes="menu--hint",
+                )
+                with Horizontal(classes="menu--buttons"):
+                    yield Button("Close", id="menu-cancel")
+                return
             with Horizontal(classes="menu--buttons"):
                 yield Button("Rename", id="menu-rename")
                 yield Button("Delete", id="menu-delete", disabled=self._is_root)
+                toggle = self._track_toggle()
+                if toggle is not None:
+                    label, button_id = toggle
+                    yield Button(label, id=button_id)
             with Horizontal(classes="menu--buttons"):
                 yield Button("New file here", id="menu-new-file")
                 yield Button("New folder here", id="menu-new-folder")
@@ -762,6 +869,73 @@ class NodeMenuScreen(ModalScreen[str]):
             "menu-delete": "delete",
             "menu-new-file": "new-file",
             "menu-new-folder": "new-folder",
+            "menu-track": "track",
+            "menu-untrack": "untrack",
+        }
+        self.dismiss(mapping.get(event.button.id, "cancel"))
+
+
+class SelectionMenuScreen(ModalScreen[str]):
+    """Bulk context menu for an explorer range selection (shift+click).
+
+    Dismisses with ``"track"``, ``"untrack"``, ``"clear"``, or
+    ``"cancel"``: apply Track/Untrack to every selected path (one
+    ``.alxeditrc`` write, one re-snapshot), or drop the selection.
+    """
+
+    CSS = """
+    SelectionMenuScreen {
+        align: center middle;
+        height: auto;
+        width: auto;
+        min-width: 56;
+    }
+    SelectionMenuScreen .menu--title {
+        padding: 0 2 1 2;
+        text-style: bold;
+    }
+    SelectionMenuScreen .menu--hint {
+        padding: 0 2 1 2;
+        width: 46;
+        color: $text-muted;
+    }
+    SelectionMenuScreen .menu--buttons {
+        height: 3;
+        align: center middle;
+    }
+    SelectionMenuScreen Button {
+        width: 14;
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, paths: list[Path]) -> None:
+        super().__init__()
+        self._paths = list(paths)
+
+    def compose(self) -> ComposeResult:
+        n = len(self._paths)
+        first = display_path(self._paths[0])
+        with Vertical(classes="menu--box"):
+            yield Label(f"{n} selected", classes="menu--title")
+            if n > 1:
+                yield Label(
+                    f"{first}  … +{n - 1} more", classes="menu--hint"
+                )
+            else:
+                yield Label(first, classes="menu--hint")
+            with Horizontal(classes="menu--buttons"):
+                yield Button(f"Track ({n})", id="sel-track")
+                yield Button(f"Untrack ({n})", id="sel-untrack")
+            with Horizontal(classes="menu--buttons"):
+                yield Button("Clear", id="sel-clear")
+                yield Button("Cancel", id="sel-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        mapping = {
+            "sel-track": "track",
+            "sel-untrack": "untrack",
+            "sel-clear": "clear",
         }
         self.dismiss(mapping.get(event.button.id, "cancel"))
 
@@ -792,15 +966,35 @@ class HelpScreen(ModalScreen[None]):
             "ctrl+s        save (save-as if untitled)\n"
             "f4 / ctrl+w   close tab\n"
             "ctrl+q        quit\n"
-            "ctrl+click    file/folder menu — rename, delete, or create\n"
-            "              a new file/folder there (mouse-first)\n"
+            "ctrl+click    file/folder menu — rename, delete, track /\n"
+            "              untrack, or create a new file/folder there\n"
+            "              (mouse-first)\n"
+            "shift+click   select a range of entries (from the last\n"
+            "              clicked one); ctrl+click then opens the bulk\n"
+            "              menu: Track (N) / Untrack (N) / Clear\n"
             "ctrl+shift+n  new folder where the cursor is (hotkey)\n"
             "ctrl+shift+x  delete the highlighted folder (hotkey)\n"
             "f2            external changes — approve or reject them\n"
             "              (a approve · r reject · A approve all · R reject all)\n"
             "Session btn   top bar — switch / create / delete sessions\n"
             "              (each session snapshots the folder as the\n"
-            "              baseline for diffs & reverts)\n"
+            "              baseline for diffs & reverts); each row shows\n"
+            "              the tree vs. that baseline: in sync / +A/-B\n"
+            "              note: without a .alxedit folder alxedit2\n"
+            "              starts as a plain editor — no tree copy,\n"
+            "              no tracked changes. Press this to start\n"
+            "              a session if you want them.\n"
+            "Settings btn  top bar — what the session mirror tracks\n"
+            "              (ctrl+.): the explorer always shows every\n"
+            "              file; 'ignore' excludes any file/folder,\n"
+            "              'track' includes dot files (off by default);\n"
+            "              paths may be globs: *.log, dist/*, .github/*\n"
+            "Tree glyphs     T = the change tracker covers this file/folder\n"
+            "                ○ = untracked (dot files by default, or an\n"
+            "                'ignore' rule); folders reflect their contents\n"
+            "                ✓ = part of a shift+click selection (bulk)\n"
+            "                +N/-M = pending external change (green/red)\n"
+            "                ctrl+click an entry: Track / Untrack it\n"
             "esc / ctrl+d  abandon a review (keeps your side; reviews\n"
             "              appear automatically when an open file\n"
             "              changes outside)\n"
@@ -810,6 +1004,7 @@ class HelpScreen(ModalScreen[None]):
             "              to it; resolved hunks drop off the list;\n"
             "              all decided → editable again;\n"
             "              ● tab = change not in baseline yet — ctrl+s commits it\n"
+            "              🔒 tab = read-only (a session-baseline file)\n"
             "alt+←/→       resize the sidebar (or drag the divider\n"
             "              between explorer and editor)\n"
             "alt+shift+←/→ resize the hunk panel (or drag its divider\n"
@@ -968,6 +1163,17 @@ class SessionScreen(ModalScreen[SessionChoice]):
             label.append(s.label, style="bold" if active else "")
             label.append(f"  ·  {s.created[:16].replace('T', ' ')}", style="dim")
             label.append(f"  ·  {s.file_count} files", style="dim")
+            # Per-session diff summary: how the working tree stands
+            # against *this* baseline (in sync / +A/-B lines).
+            if app is not None and hasattr(app, "_session_diff_stats"):
+                changed, a, r = app._session_diff_stats(s.id)
+                if changed == 0:
+                    label.append("  ·  in sync", style="dim")
+                elif a == 0 and r == 0:
+                    label.append(f"  ·  {changed} file(s) differ", style="dim")
+                else:
+                    label.append(f"  ·  +{a}", style="green")
+                    label.append(f"/-{r}", style="red")
             lv.append(ListItem(Label(label), id=f"sess-{s.id}"))
         if self._sessions:
             lv.index = 0
@@ -1021,6 +1227,7 @@ class SessionScreen(ModalScreen[SessionChoice]):
         sessions.delete_session(app.root, sid)
         self._sessions = [s for s in self._sessions if s.id != sid]
         await self._refresh_list()
+        app._refresh_tree()  # .alxedit/<sid> just left the explorer
         self.app.notify(f"deleted session {sid}", title="Sessions")
 
     def action_cancel(self) -> None:
@@ -1035,6 +1242,190 @@ class SessionScreen(ModalScreen[SessionChoice]):
             await self.action_delete()
         elif event.button.id == "sess-cancel":
             self.action_cancel()
+
+
+class SettingsScreen(ModalScreen[None]):
+    """Project settings (``.alxeditrc``): what the session mirror tracks.
+
+    The explorer always shows *every* file in the project; these settings
+    control the mirror (the diff/revert baseline) and change tracking:
+
+    - dot files/folders are untracked by default — "Track" includes a
+      specific one (e.g. ``.env``);
+    - "Ignore" excludes any file or folder (e.g. a massive image);
+    - a path may be a glob (``*.log``, ``dist/*``) that also matches
+      across folders.
+
+    Changes persist immediately and re-reconcile the active session.
+    """
+
+    CSS = """
+    SettingsScreen {
+        align: left middle;
+        height: auto;
+        max-height: 28;
+        width: auto;
+        min-width: 64;
+        max-width: 90;
+    }
+    SettingsScreen #settings-head {
+        text-style: bold;
+        padding: 0 2 1 2;
+    }
+    SettingsScreen .settings--section {
+        text-style: bold;
+        color: $text-muted;
+        padding: 1 0 0 2;
+    }
+    SettingsScreen .settings--row {
+        height: 3;
+        align-vertical: middle;
+        padding: 0 2;
+    }
+    SettingsScreen .settings--row Label {
+        width: 1fr;
+        text-overflow: ellipsis;
+    }
+    SettingsScreen .settings--row Button {
+        width: 5;
+    }
+    SettingsScreen .settings--none {
+        color: $text-muted;
+        padding: 0 2;
+    }
+    SettingsScreen .settings--add {
+        height: 3;
+        align: left middle;
+        margin: 1 2;
+    }
+    SettingsScreen .settings--add Input {
+        width: 1fr;
+        margin-right: 1;
+    }
+    SettingsScreen .settings--add Button {
+        width: 8;
+        margin-left: 1;
+    }
+    SettingsScreen .settings--buttons {
+        height: 3;
+        align: right middle;
+        padding: 0 2;
+    }
+    SettingsScreen .settings--buttons Button {
+        width: 10;
+    }
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        current: project_settings.Settings,
+        apply: Callable[[project_settings.Settings], None],
+    ) -> None:
+        super().__init__()
+        self._root = root
+        self._ignore: list[str] = list(current.ignore)
+        self._track: list[str] = list(current.track)
+        self._apply = apply
+
+    def compose(self) -> ComposeResult:
+        yield Label(
+            "settings — what the session mirror tracks",
+            id="settings-head",
+        )
+        yield Vertical(id="settings-body")
+        with Horizontal(classes="settings--add"):
+            yield Input(
+                placeholder="path or glob, e.g. assets/images, .env, *.log",
+                id="settings-path",
+            )
+            yield Button("Ignore", id="settings-add-ignore")
+            yield Button("Track", id="settings-add-track")
+        with Horizontal(classes="settings--buttons"):
+            yield Button("Done", variant="primary", id="settings-done")
+
+    async def on_mount(self) -> None:
+        await self._refresh()
+
+    async def _refresh(self) -> None:
+        """Rebuild the entry rows (after an add/remove)."""
+        body = self.query_one("#settings-body", Vertical)
+        await body.remove_children()
+        rows: list[Widget] = [
+            Label(
+                "ignore — never mirrored or tracked",
+                classes="settings--section",
+            )
+        ]
+        if not self._ignore:
+            rows.append(Label("(none)", classes="settings--none"))
+        for i, entry in enumerate(self._ignore):
+            rows.append(
+                Horizontal(
+                    Label(entry),
+                    Button("x", id="settings-remove", name=f"ignore:{i}"),
+                    classes="settings--row",
+                )
+            )
+        rows.append(
+            Label(
+                "track — dot files to include (off by default)",
+                classes="settings--section",
+            )
+        )
+        if not self._track:
+            rows.append(Label("(none)", classes="settings--none"))
+        for i, entry in enumerate(self._track):
+            rows.append(
+                Horizontal(
+                    Label(entry),
+                    Button("x", id="settings-remove", name=f"track:{i}"),
+                    classes="settings--row",
+                )
+            )
+        await body.mount(*rows)
+
+    def _add_entry(self, which: str) -> bool:
+        """Read the input, normalize it, and add it to *which* list."""
+        raw = self.query_one("#settings-path", Input).value
+        entry = project_settings.normalize(raw)
+        if not entry or ".." in entry.split("/"):
+            self.app.notify("enter a path inside the project root", title="Settings")
+            return False
+        lst = self._ignore if which == "ignore" else self._track
+        if entry in lst:
+            return False
+        lst.append(entry)
+        return True
+
+    async def _add(self, which: str) -> None:
+        if self._add_entry(which):
+            self.query_one("#settings-path", Input).value = ""
+            await self._commit()
+
+    async def _commit(self) -> None:
+        """Persist + apply, then refresh the rows."""
+        self._apply(
+            project_settings.Settings(
+                rules=tuple(("ignore", p) for p in self._ignore)
+                + tuple(("track", p) for p in self._track)
+            )
+        )
+        await self._refresh()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "settings-add-ignore":
+            await self._add("ignore")
+        elif bid == "settings-add-track":
+            await self._add("track")
+        elif bid == "settings-remove":
+            which, idx = event.button.name.split(":", 1)
+            lst = self._ignore if which == "ignore" else self._track
+            lst.pop(int(idx))
+            await self._commit()
+        elif bid == "settings-done":
+            self.dismiss()
 
 
 # --------------------------------------------------------------------------- #
@@ -1295,6 +1686,7 @@ class AlxEditApp(App):
         Binding("f4,ctrl+w", "close_buffer", "Close tab", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
         Binding("f2", "changes", "Changes", show=False),
+        Binding("ctrl+.", "settings", "Settings", show=False),
         Binding("f1", "help", "Help", show=False),
         Binding("alt+left", "sidebar_left", "Narrow sidebar", show=False),
         Binding("alt+right", "sidebar_right", "Widen sidebar", show=False),
@@ -1342,11 +1734,17 @@ class AlxEditApp(App):
         self._pane_counter = 0
         #: The active session id under ``.alxedit/`` (the diff baseline).
         self.session_id: Optional[str] = None
+        #: Project settings (``.alxeditrc``): what the mirror tracks.
+        self._settings = project_settings.load(self.root)
         #: path -> (size, mtime_ns) as of the last watcher tick.
         self._snap: dict[Path, tuple[int, int]] = {}
         #: path -> tracked external change.
         self._changes: dict[Path, ChangeRecord] = {}
         self._tree_markers: dict[Path, tuple[int, int]] = {}
+        #: Explorer range selection (shift+click), for bulk Track/Untrack:
+        #: the anchor entry and the selected paths in visible tree order.
+        self._sel_anchor: Optional[Path] = None
+        self._selection: list[Path] = []
         #: path -> monotonic time of our own write (self-write guard).
         self._self_writes: dict[Path, float] = {}
         self._change_listeners: set = set()
@@ -1383,6 +1781,7 @@ class AlxEditApp(App):
             yield Button("Close", compact=True, id="btn-close")
             yield Button("Changes", compact=True, id="btn-changes")
             yield Button("Session", compact=True, id="btn-session")
+            yield Button("Settings", compact=True, id="btn-settings")
         with Horizontal(id="middle"):
             with Horizontal(id="sidebar"):
                 yield Explorer(self.root)
@@ -1473,24 +1872,44 @@ class AlxEditApp(App):
         self._run_modal(self._startup())
 
     async def _startup(self) -> None:
-        """Pick (or create) the active session, then open the initial files."""
+        """Set the active session (if any), then open the initial files.
+
+        If the working directory has a ``.alxedit`` folder with sessions,
+        activate one — that session is the baseline for tracked changes.
+        A single session activates straight away; several get a picker
+        (open / new / delete). Without any, alxedit2 runs in **basic
+        editor mode**: no tree copy, no tracked changes. The Session
+        button (top bar) can still start a session at any time.
+        """
         found = sessions.list_sessions(self.root)
         if found:
-            choice = await self.push_screen_wait(
-                SessionScreen(found, starting=True)
-            )
-            if choice.action == "new":
-                sid = await self._create_session(choice.label)
-            elif choice.action == "open" and choice.sid is not None:
-                sid = choice.sid
-            else:  # cancel: fall back to the most recent session
+            if len(found) == 1:
                 sid = found[0].id
+            else:
+                choice = await self.push_screen_wait(
+                    SessionScreen(found, starting=True)
+                )
+                if choice.action == "new":
+                    sid = await self._create_session(choice.label)
+                elif choice.action == "open" and choice.sid is not None:
+                    sid = choice.sid
+                else:  # cancel: fall back to the most recent session
+                    sid = found[0].id
+            if not sessions.session_dir(self.root, sid).is_dir():
+                # e.g. it was deleted while the picker was open
+                sid = await self._create_session(None)
+            self._activate_session(sid)
+            self.notify(
+                f"session: {sessions.session_label(self.root, sid)}",
+                title="Session",
+            )
         else:
-            sid = await self._create_session(None)
-        if not sessions.session_dir(self.root, sid).is_dir():
-            # e.g. it was deleted while the picker was open
-            sid = await self._create_session(None)
-        self._activate_session(sid)
+            # no .alxedit folder: plain editor, no tracked changes
+            self.session_id = None
+            self.notify(
+                "no .alxedit folder — basic editor mode (no tracked changes)",
+                title="Session",
+            )
 
         for path in self.initial_paths:
             try:
@@ -1502,17 +1921,13 @@ class AlxEditApp(App):
         area = self.active_area
         if area is not None:
             area.focus()
-        self.notify(
-            f"session: {sessions.session_label(self.root, sid)}",
-            title="Session",
-        )
 
     async def _create_session(self, label: Optional[str]) -> str:
         """Create a session and mirror the tree into it, with a progress popup."""
         sid = sessions.create_session(self.root, label)
         screen = SyncScreen()
         await self.push_screen(screen)
-        files = sessions.iter_tracked_files(self.root)
+        files = sessions.iter_tracked_files(self.root, self._settings)
         total = len(files)
         for index, path in enumerate(files):
             try:
@@ -1525,7 +1940,16 @@ class AlxEditApp(App):
         screen.update(total, total)
         await asyncio.sleep(0)
         screen.dismiss()
+        self._refresh_tree()  # .alxedit/<sid> just appeared in the explorer
         return sid
+
+    def _session_diff_stats(self, sid: str) -> tuple[int, int, int]:
+        """(changed files, +lines, -lines) of the working tree vs. a
+        session's baseline — the per-session summary in the picker."""
+        try:
+            return sessions.session_diff_stats(self.root, sid, self._settings)
+        except Exception:
+            return 0, 0, 0
 
     def _activate_session(self, sid: str) -> None:
         """Make *sid* the active session (diff baseline = its mirror)."""
@@ -1576,7 +2000,10 @@ class AlxEditApp(App):
             for mfile in sorted(files_dir.rglob("*")):
                 if not mfile.is_file():
                     continue
-                path = self.root / mfile.relative_to(files_dir)
+                rel = mfile.relative_to(files_dir).as_posix()
+                if not project_settings.should_track(self._settings, rel):
+                    continue  # untracked now: not a tracked deletion
+                path = self.root / rel
                 if path in disk_set or path in self._changes:
                     continue
                 self._changes[path] = ChangeRecord(
@@ -1623,6 +2050,8 @@ class AlxEditApp(App):
     async def _reset_buffers(self) -> None:
         """Close all tabs but one; reset that one to a fresh untitled buffer."""
         areas = list(self._panes)
+        if not areas:
+            return  # empty tab area (basic mode): nothing to reset
         for area in areas[:-1]:
             pane = self._panes.pop(area)
             self.buffers.pop(area, None)
@@ -1692,7 +2121,8 @@ class AlxEditApp(App):
         differs from the disk); a bold ``●`` marks a buffer that is **not
         committed** to the session baseline (buffer differs from the
         mirror); ``†`` marks a file that changed on disk outside the
-        editor; ``⇄`` marks the inline diff review in progress.
+        editor; ``⇄`` marks the inline diff review in progress; ``🔒``
+        marks a read-only tab (a session-store file: the baseline).
         """
         buf = self.buffers.get(area)
         pane = self._panes.get(area)
@@ -1702,6 +2132,9 @@ class AlxEditApp(App):
         # Colored file name while unsaved (buffer != disk).
         name_style = Style(bold=True, color=theme.warning) if buf.unsaved else None
         label = Text(buf.title, style=name_style)
+        # 🔒 while read-only (session-store file: the baseline).
+        if getattr(area, "read_only", False):
+            label.append(" 🔒", Style(bold=True, color=theme.primary))
         # ● while not committed to the session baseline (buffer != mirror).
         # While the diff is on screen, show the pre-diff dirty state.
         dirty = buf.modified and (
@@ -1723,8 +2156,22 @@ class AlxEditApp(App):
     # file actions
     # ------------------------------------------------------------------ #
 
+    def _is_session_store_file(self, path: Path) -> bool:
+        """True if *path* lies inside the ``.alxedit`` session store — i.e.
+        it is part of a session mirror (the diff baseline)."""
+        store = (self.root / sessions.SESS_DIR_NAME).resolve()
+        try:
+            path.resolve().relative_to(store)
+        except ValueError:
+            return False
+        return True
+
     async def open_path(self, path: str | Path) -> TextArea:
-        """Open *path* in a tab, or activate its tab if it is already open."""
+        """Open *path* in a tab, or activate its tab if it is already open.
+
+        Files inside the ``.alxedit`` session store (the mirrors) open
+        read-only — they are the baseline, not editable content.
+        """
         target = Path(path).expanduser().resolve()
         if not target.is_file():
             raise FileNotFoundError(f"not a file: {target}")
@@ -1739,11 +2186,13 @@ class AlxEditApp(App):
         except UnicodeDecodeError as exc:
             raise ValueError(f"not a text file: {target}") from exc
 
+        store_file = self._is_session_store_file(target)
         area = TextArea(
             text=text,
             language=language_for_path(target),
             show_line_numbers=True,
             soft_wrap=False,
+            read_only=store_file,
         )
         self.buffers[area] = Buffer(path=target, saved_text=text)
         await self._add_pane(area, target.name)
@@ -1758,12 +2207,17 @@ class AlxEditApp(App):
         else:
             # No pending change: load the session baseline (mirror). The two
             # indicators fall out — color (buffer != disk) and dot (buffer !=
-            # baseline).
-            if self.session_id is not None:
+            # baseline). (Session-store files have no baseline of their own.)
+            if self.session_id is not None and not store_file:
                 buf.baseline = sessions.read_mirror_text(self.root, self.session_id, target)
         self._recompute_flags(buf, area)
         self._retab(area)
         self._statusbar_refresh()
+        if store_file:
+            self.notify(
+                f"{target.name}: session store — opened read-only",
+                title="Read-only",
+            )
         return area
 
     async def action_new_buffer(self) -> None:
@@ -1801,12 +2255,80 @@ class AlxEditApp(App):
             node = self._current_node()
         self._run_modal(self._do_node_menu(node, tree.root is node))
 
+    def action_selection_menu(self) -> None:
+        """Open the bulk menu for the current explorer selection.
+
+        (shift+click builds the selection; this is the ctrl+click
+        follow-up when two or more entries are selected.)
+        """
+        if len(self._selection) > 1:
+            self._run_modal(self._do_selection_menu())
+
+    async def _do_selection_menu(self) -> None:
+        choice = await self.push_screen_wait(
+            SelectionMenuScreen(list(self._selection))
+        )
+        if choice in ("track", "untrack"):
+            self._set_tracked_many(list(self._selection), choice == "track")
+            self._clear_selection()
+        elif choice == "clear":
+            self._clear_selection()
+
+    def _select_range(self, node) -> None:
+        """Shift+click: select the visible range between the last clicked
+        entry and *node* (inclusive) — for the bulk Track/Untrack menu.
+
+        The first shift+click starts the selection at that entry; each
+        following one re-ranges from the anchor to the new entry.
+        """
+        tree = self.query_one(Explorer)
+        path = node.data.path if node.data is not None else self.root
+        order: list[Path] = []
+
+        def walk(n) -> None:
+            if n.data is not None:
+                order.append(n.data.path)
+            for child in n.children:
+                walk(child)
+
+        walk(tree.root)
+        try:
+            i = (
+                order.index(self._sel_anchor)
+                if self._sel_anchor is not None
+                else -1
+            )
+            j = order.index(path)
+        except ValueError:
+            i = j = -1
+        if i == -1 or i == j or j == -1:
+            self._sel_anchor = path
+            self._selection = [path]
+        else:
+            lo, hi = sorted((i, j))
+            self._selection = order[lo : hi + 1]
+            self._sel_anchor = path
+        self._refresh_tree_markers()  # repaints the tree (✓ marks)
+        self.notify(
+            f"{len(self._selection)} selected — ctrl+click for Track/Untrack",
+            title="Select",
+        )
+
+    def _clear_selection(self) -> None:
+        """Drop the explorer range selection (plain click / after apply)."""
+        if self._selection or self._sel_anchor is not None:
+            self._selection = []
+            self._sel_anchor = None
+            self._refresh_tree_markers()
+
     async def _do_node_menu(self, node, is_root: bool) -> None:
         choice = await self.push_screen_wait(NodeMenuScreen(node.data.path, is_root))
         if choice == "rename":
             await self._do_node_rename(node)
         elif choice == "delete":
             await self._do_node_delete(node)
+        elif choice in ("track", "untrack"):
+            self._set_tracked(node.data.path, choice == "track")
         elif choice in ("new-file", "new-folder"):
             parent, list_node = self._parent_dir(node)
             if choice == "new-file":
@@ -1961,6 +2483,11 @@ class AlxEditApp(App):
         area = self.active_area
         if area is None:
             return
+        if area.read_only:
+            self.notify(
+                "opened read-only (session store)", title="Save"
+            )
+            return
         buf = self.buffers[area]
         if buf.path is None:
             await self._do_save_as()
@@ -2081,6 +2608,121 @@ class AlxEditApp(App):
     def action_sessions(self) -> None:
         """Top-bar Session button: switch to / create / delete sessions."""
         self._run_modal(self._do_session_pick())
+
+    def action_settings(self) -> None:
+        """Top-bar Settings button: what the session mirror tracks."""
+        self.push_screen(
+            SettingsScreen(self.root, self._settings, self._apply_settings)
+        )
+
+    def _apply_settings(self, new: project_settings.Settings) -> None:
+        """Persist project settings and re-derive what is tracked.
+
+        Takes effect for new sessions immediately; the active session's
+        change list is re-reconciled so newly excluded files settle out
+        of it and newly tracked dot files can appear.
+        """
+        project_settings.save(self.root, new)
+        self._settings = new
+        self._changes.clear()
+        self._init_snapshot()
+        self._reconcile_with_mirror()
+        self._emit_changes()
+
+    def _set_tracked(self, path: Path, want: bool) -> None:
+        """Add *path* to (or remove it from) the tracked list.
+
+        Edits ``.alxeditrc``: a folder action clears every rule for the
+        folder and below it, then applies the new one — fully recursive
+        and decisive. A file action replaces the rules for that file
+        only (so it can be carved out of, or excluded from, a folder
+        rule; the last matching rule wins). Tracking writes an explicit
+        ``track`` rule only when the default or a broader rule would
+        leave the path untracked; untracking always writes an
+        ``ignore`` rule. The active session's change list is then
+        re-derived — newly excluded files settle out of it, newly
+        included dot files may appear as changes.
+        """
+        try:
+            rel = project_settings.normalize(
+                path.resolve().relative_to(self.root.resolve())
+            )
+        except ValueError:
+            self.notify("outside the project", title="Track")
+            return
+        if not rel:
+            return
+        self._apply_settings(
+            self._settings_toggled(self._settings, rel, want, path.is_dir())
+        )
+        self.notify(
+            ("tracking " if want else "untracking ") + rel,
+            title="Track",
+        )
+
+    def _settings_toggled(
+        self,
+        cur: project_settings.Settings,
+        rel: str,
+        want: bool,
+        is_folder: bool = False,
+    ) -> project_settings.Settings:
+        """Settings after one Track (*want*) / Untrack of root-relative
+        *rel*.
+
+        For a *folder*, every rule for the folder itself or a path below
+        it is dropped first, so the action is fully recursive and
+        decisive (tracking a folder brings back previously excluded
+        children; untracking one clears earlier per-file carves-out).
+        For a *file*, only its own rules are replaced — it becomes the
+        last (winning) rule for that path, which is how files are carved
+        out of, or excluded from, folder rules. An explicit ``track``
+        rule is only written when the default or a broader rule would
+        otherwise leave the path untracked (dot paths, files inside an
+        ignored folder); untracking always writes an ``ignore``."""
+        r = rel.casefold()
+        rules: list[tuple[str, str]] = []
+        for verb, path in cur.rules:
+            p = path.casefold()
+            if p == r:
+                continue
+            if is_folder and p.startswith(r + "/"):
+                continue  # the folder action overrides everything below
+            rules.append((verb, path))
+        if want:
+            if not project_settings.should_track(
+                project_settings.Settings(rules=tuple(rules)), rel
+            ):
+                rules.append(("track", rel))
+        else:
+            rules.append(("ignore", rel))
+        return project_settings.Settings(rules=tuple(rules))
+
+    def _set_tracked_many(self, paths: list[Path], want: bool) -> None:
+        """Track/Untrack a batch of paths in a single settings write
+        (the shift+click bulk menu). The project root and session-store
+        entries are skipped; the change list re-derives only once."""
+        st = self._settings
+        count = 0
+        for path in paths:
+            try:
+                rel = project_settings.normalize(
+                    path.resolve().relative_to(self.root.resolve())
+                )
+            except ValueError:
+                continue
+            if not rel or rel.split("/")[0] == sessions.SESS_DIR_NAME:
+                continue
+            st = self._settings_toggled(st, rel, want, path.is_dir())
+            count += 1
+        if not count:
+            self.notify("nothing applicable in the selection", title="Track")
+            return
+        self._apply_settings(st)
+        self.notify(
+            f"{'tracking' if want else 'untracking'} {count} path(s)",
+            title="Track",
+        )
 
     # --- inline diff ---------------------------------------------------- #
 
@@ -2513,19 +3155,26 @@ class AlxEditApp(App):
             pass
 
     def _iter_tracked_files(self) -> list[Path]:
-        return sessions.iter_tracked_files(self.root)
+        return sessions.iter_tracked_files(self.root, self._settings)
 
     def _init_snapshot(self) -> None:
         """Capture the starting state (stat sigs for the change watcher).
 
         The content baseline lives in the session mirror on disk.
+
+        The snapshot is *replaced*, not extended: entries for files that
+        are no longer tracked (e.g. after Untrack) must disappear, or the
+        next tick would diff them out of ``seen`` and report them as
+        phantom deletions.
         """
+        snap: dict[Path, tuple[int, int]] = {}
         for path in self._iter_tracked_files():
             try:
                 st = path.stat()
             except OSError:
                 continue
-            self._snap[path] = (st.st_size, st.st_mtime_ns)
+            snap[path] = (st.st_size, st.st_mtime_ns)
+        self._snap = snap
 
     def _watch_tick(self) -> None:
         if self.session_id is None:
@@ -2651,6 +3300,48 @@ class AlxEditApp(App):
         if self.session_id is None:
             return False
         return sessions.mirror_exists(self.root, self.session_id, path)
+
+    def _is_tracked_path(self, path: Path) -> bool:
+        """Whether the change tracker (the session mirror) covers *path*.
+
+        A file is covered when the project settings allow it (dot files
+        off by default; ``ignore``/``track`` rules in ``.alxeditrc``
+        override). A folder counts as covered when *any* file inside it
+        does. The session store (``.alxedit``) is never covered.
+        """
+        root = self.root.resolve()
+        target = path.resolve()
+        try:
+            rel = target.relative_to(root)
+        except ValueError:
+            return False
+        if rel.parts and rel.parts[0] == sessions.SESS_DIR_NAME:
+            return False
+        if target.is_file():
+            return project_settings.should_track(
+                self._settings, rel.as_posix()
+            )
+        # Folder: covered when any file inside is. Early-exit, with a
+        # bound so a huge untracked tree (node_modules, assets, ...) can
+        # not stall a repaint.
+        limit = 4096
+        try:
+            for i, entry in enumerate(target.rglob("*")):
+                if i >= limit:
+                    return True  # assume a big tree has tracked content
+                if not entry.is_file():
+                    continue
+                try:
+                    erel = entry.relative_to(root)
+                except ValueError:
+                    continue
+                if project_settings.should_track(
+                    self._settings, erel.as_posix()
+                ):
+                    return True
+        except OSError:
+            return True  # tree changed mid-walk; don't block the paint
+        return False
 
     def _refresh_tree_markers(self) -> None:
         """Recompute the explorer's ``+N/-M`` markers and repaint the tree.
@@ -3167,6 +3858,8 @@ class AlxEditApp(App):
             self.action_changes()
         elif button_id == "btn-session":
             self.action_sessions()
+        elif button_id == "btn-settings":
+            self.action_settings()
 
 
 def _same_file(a: Path, b: Path) -> bool:

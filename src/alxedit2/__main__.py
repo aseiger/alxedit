@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from . import __version__
 from .app import AlxEditApp
 
 
@@ -43,6 +44,12 @@ def main() -> None:
             "A personal IDE-style TUI file editor: "
             "file explorer + tabbed, syntax-highlighted editor."
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"alxedit2 {__version__}",
+        help="print the version and exit",
     )
     parser.add_argument(
         "paths",

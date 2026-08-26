@@ -20,12 +20,13 @@ python3 -m venv .venv
 .venv/bin/alxedit2
 ```
 
-**Global install** (so `alxedit2` is on your `PATH` in any directory):
+**Global install** (so `alxedit2` is on your `PATH` in any directory) —
+from a checkout of this repo:
 
 ```sh
-pipx install /home/alex/devel/alxedit2     # isolated env, recommended
+pipx install .                              # isolated env, recommended
 # — or —
-pip install /home/alex/devel/alxedit2      # into the active environment
+pip install .                               # into the active environment
 ```
 
 After `pipx`, just run `alxedit2` from anywhere.
@@ -33,11 +34,12 @@ After `pipx`, just run `alxedit2` from anywhere.
 ## Usage
 
 ```sh
-alxedit2 [PATHS…] [--root DIR]
+alxedit2 [PATHS…] [--root DIR] [--version]
 ```
 
 - `PATHS` — files to open, and/or a directory to use as the working directory
   (the first directory given becomes the working directory).
+- `--version` — print the version and exit.
 - `--root DIR` — set the working directory explicitly (wins over any
   directory passed in `PATHS`).
 - If no directory is given, the working directory is the current one (`pwd`).
@@ -61,19 +63,24 @@ alxedit2 --root ~/src/myproject main.py   # explicit working dir + a file
 | `ctrl+n`        | New buffer                      |
 | `ctrl+s`        | Save (save-as if untitled)      |
 | `ctrl+shift+s`  | Save as…                        |
-| `ctrl+click` (explorer) | File/folder menu — **Rename**, **Delete**, **New file here**, **New folder here**. Files: "here" = its folder. Folders: "here" = inside them |
+| `ctrl+click` (explorer) | File/folder menu — **Rename**, **Delete**, **Track**/**Untrack** (edit `.alxeditrc`), **New file here**, **New folder here**. Files: "here" = its folder. Folders: "here" = inside them |
+| `shift+click` (explorer) | Select a range of files/folders (from the last clicked entry — marked ✓). Then `ctrl+click` opens the **bulk** menu: **Track (N)** / **Untrack (N)** / **Clear** — one `.alxeditrc` write for the whole range |
 | `ctrl+shift+n`  | New folder where the cursor is (hotkey alternative) |
 | `ctrl+shift+x`  | Delete highlighted folder (hotkey alternative; tracked files inside stay revertable) |
 | `f4` / `ctrl+w` | Close tab                       |
 | `ctrl+q`        | Quit                            |
 | `f2`            | External changes — **approve or reject** them (see below)|
 | `s`             | Sessions (open / new / delete)  |
+| `ctrl+.`        | Settings — what the mirror tracks (see below) |
 | `f1`            | Help                            |
 
 ## Sessions
 
-When alxedit2 starts it syncs the whole working tree into a **session**
-under `.alxedit/` (a progress bar shows while files are copied):
+Sessions are optional. When alxedit2 starts, if the working directory
+already has a `.alxedit/` folder it offers to open (or create) a **session**
+— a sync of the working tree under `.alxedit/<id>/` (a progress bar
+shows while files are copied; what counts as “tracked” is configurable,
+see [Settings](#settings-alexeditrc)):
 
 ```
 .alxedit/
@@ -86,10 +93,17 @@ The mirror is the **baseline** for everything else: diffs against external
 edits, reverts, and the “approved” state all compare against *this session’s*
 copy — not memory, not git.
 
-- **Startup** — if `.alxedit/` already has sessions you get a picker:
-  open an existing one (it re-baselines the diff on that snapshot),
-  create a new one (fresh mirror, with a progress bar), or delete ones you
-  don’t want. With no sessions it just creates one and goes.
+- **Startup** — if the working directory has a `.alxedit/` folder with
+  sessions you get a picker: open an existing one (it re-baselines the diff
+  on that snapshot), create a new one (fresh mirror, with a progress bar),
+  or delete ones you don’t want. Every row also shows a live summary of
+  the working tree against *that* baseline — `in sync`, or `+A/-B` lines
+  when it has drifted (a quick way to see which session is closest to
+  “now”).
+- **No `.alxedit/` folder? Basic editor mode.** alxedit2 does *not* copy
+  the tree or track changes — it just runs as a plain editor (explorer,
+  tabs, syntax highlighting, save). Use the `s` key / **Session** button to
+  start a session later if you want tracked changes.
 - **`s` key / “Session” button** — the same picker any time, so you can
   start a new baseline mid-run (e.g. “everything the agent did so far is
   fine, start a fresh session for the next round”) or jump back to an
@@ -99,9 +113,62 @@ copy — not memory, not git.
 
 Sessions are plain files: inspect them, `cp -r` one to preserve it,
 `rm -rf .alxedit/<id>` to remove one manually. (`.alxedit/` itself is
-excluded from the mirror.)
+excluded from the mirror.) They appear in the explorer, which refreshes
+on its own when a session is created or deleted, and open **read-only**
+in a tab (marked 🔒) — they *are* the baseline, so saving over one in
+place would silently move the baseline; use Save As to copy one out if
+you want to keep it. The ctrl+click menu offers no file operations for
+entries inside `.alxedit/` (no rename, delete, new-file, or
+track/untrack) — only a read-only notice and close.
+
+## Settings (`.alxeditrc`)
+
+The **Settings** button (top bar, or `ctrl+.`) edits the project's
+`.alxeditrc` file — plain text, also hand-editable:
+
+```
+ignore <path>   never mirror/track this file or folder
+track  <path>   mirror/track this dot file/dot folder despite the default
+```
+
+The explorer always shows **every** file in the project; these settings
+control what the session mirror (the diff/revert baseline) actually
+covers:
+
+- regular files and folders are tracked by default;
+- dot files and dot folders (`.env`, `.github/`, …) are **not** tracked
+  unless listed with `track`;
+- `ignore` opts anything out — e.g. a massive image you don't want
+  copied into every session.
+
+Paths are relative to the project root and case-insensitive. A folder
+entry is **recursive** — it covers everything below it — and when
+several rules match a path the **last one wins**: the most recent
+Track/Untrack is the one in effect, so a folder action is always
+decisive and you can still pick individual files back out afterwards:
+
+```
+ignore src        # untrack the whole folder (recursive)
+track  src/app.py # ...but keep this one file
+```
+
+Paths may also be **globs** — an entry containing `*`, `?`, or `[` matches as a
+glob against the relative path *and* each of its folder prefixes (so `*`
+crosses directory boundaries):
+
+```
+ignore *.log      # every .log file, wherever it is
+ignore dist/*     # everything under dist/
+track  .github/*  # include the workflows in a dot folder
+```
+
+Changes apply immediately (new sessions use them right away; the active
+session's change list is re-reconciled).
 
 ## External change tracking (AI-agent aware)
+
+> Requires an active session — in basic editor mode (no `.alxedit/` folder)
+> there is no baseline, so nothing is tracked.
 
 alxedit2 watches the project tree for changes made **outside** the editor —
 for example an AI agent writing files while you watch. Every 0.8 s the tree
@@ -119,6 +186,17 @@ marker next to the file in the explorer — the lines added/removed
 relative to the session copy (green `+`, red `-`). A file without a
 marker matches the session snapshot exactly; the marker disappears the
 moment the file is saved, approved, or rejected.
+
+Every explorer entry also carries a **tracking glyph**: `T` (accent
+blue) means the change tracker covers it — it is in the session mirror
+— while `○` (dim) means it is untracked (dot files by default, or an
+`ignore` rule in `.alxeditrc`). Folders reflect their contents: `T`
+when anything inside is tracked, `○` when nothing is. Flip a rule in
+Settings — or right from the tree: **ctrl+click an entry and pick
+Track / Untrack** — and the glyphs follow. Each action rewrites the
+rule for that path so it becomes the last (winning) one — folder rules
+are recursive, and a file can be picked back out of an untracked folder.
+Everything lands in `.alxeditrc`.
 
 If the file is already open, the tab **immediately switches to a diff
 review** — there is no separate diff window. Both sides are painted into

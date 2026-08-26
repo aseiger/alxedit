@@ -11,13 +11,15 @@ content the user last approved (session start, or the editor's most recent
 save). When alxedit2 saves a file, the mirror copy is updated too, so the
 baseline always tracks the user's latest approval.
 
-Only "tracked" files are mirrored: dot-directories (``.git``, ``.venv``,
-``.alxedit`` itself), ``__pycache__``/``node_modules``, and files larger
-than :data:`MAX_TRACK_BYTES` are skipped.
+Only "tracked" files are mirrored: dot files and dot folders (unless
+explicitly tracked, see :mod:`alxedit2.settings`), files the project
+settings ignore, ``__pycache__``/``node_modules``, and files larger than
+:data:`MAX_TRACK_BYTES` are skipped.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
 import secrets
 import shutil
@@ -25,6 +27,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
+
+from alxedit2 import settings as project_settings
 
 #: Name of the per-project session directory.
 SESS_DIR_NAME = ".alxedit"
@@ -156,6 +160,93 @@ def delete_session(root: Path, sid: str) -> None:
     shutil.rmtree(session_dir(root, sid))
 
 
+#: How many files :func:`session_diff_stats` diffs before giving up
+#: (keeps the session picker snappy on huge trees).
+MAX_DIFF_FILES: int = 5000
+
+
+def _line_count(data: bytes) -> int:
+    """Lines in *data* (a trailing newline does not add an empty line)."""
+    if not data:
+        return 0
+    n = data.count(b"\n")
+    return n + (0 if data.endswith(b"\n") else 1)
+
+
+def _line_diff(old: str, new: str) -> tuple[int, int]:
+    """Lines added / removed going from *old* to *new* (difflib)."""
+    added = removed = 0
+    matcher = difflib.SequenceMatcher(
+        None, old.splitlines(), new.splitlines(), autojunk=False
+    )
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("replace", "delete"):
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            added += j2 - j1
+    return added, removed
+
+
+def session_diff_stats(
+    root: Path, sid: str, settings: Optional[project_settings.Settings] = None
+) -> tuple[int, int, int]:
+    """Working tree vs. the session's mirror: ``(changed, added, removed)``.
+
+    *changed* counts files whose on-disk content differs from the mirror
+    copy (or where only one side exists). *added* / *removed* are the
+    line-based totals (difflib, mirror → disk), so ``+A/-B`` reads as
+    "the working tree is A lines bigger, B lines smaller than this
+    baseline". Identical files are compared byte-for-byte and skipped;
+    binary files count as changed without line counts. Capped at
+    :data:`MAX_DIFF_FILES` files so the picker stays responsive.
+    """
+    root = Path(root)
+    files_dir = _files_dir(root, sid)
+    st = settings if settings is not None else project_settings.Settings()
+
+    mirror_rels: set[str] = set()
+    if files_dir.is_dir():
+        for p in files_dir.rglob("*"):
+            if p.is_file():
+                mirror_rels.add(p.relative_to(files_dir).as_posix())
+
+    disk_rels: set[str] = set()
+    for p in iter_tracked_files(root, st):
+        disk_rels.add(p.relative_to(root).as_posix())
+
+    changed = added = removed = 0
+    for n, rel in enumerate(sorted(mirror_rels | disk_rels)):
+        if n >= MAX_DIFF_FILES:
+            break
+        try:
+            disk = (root / rel).read_bytes()
+        except OSError:
+            disk = None
+        try:
+            base = (files_dir / rel).read_bytes()
+        except OSError:
+            base = None
+        if disk is not None and disk == base:
+            continue
+        changed += 1
+        if disk is None and base is not None:
+            removed += _line_count(base)  # deleted on disk
+            continue
+        if base is None and disk is not None:
+            added += _line_count(disk)  # new since the session
+            continue
+        if disk is None:
+            continue
+        try:
+            a, b = disk.decode("utf-8"), base.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            continue  # binary: file counted, lines not
+        da, dr = _line_diff(b, a)
+        added += da
+        removed += dr
+    return changed, added, removed
+
+
 def session_label(root: Path, sid: str) -> str:
     meta = _read_meta(root, sid)
     return str(meta.get("label", sid)) if meta is not None else sid
@@ -166,10 +257,20 @@ def session_label(root: Path, sid: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def iter_tracked_files(root: Path) -> list[Path]:
-    """All mirrorable files under *root* (dot-dirs and big files skipped)."""
+def iter_tracked_files(
+    root: Path, settings: Optional[project_settings.Settings] = None
+) -> list[Path]:
+    """All tracked files under *root*.
+
+    Skipped: the session dir, ``__pycache__``/``node_modules``, files
+    larger than :data:`MAX_TRACK_BYTES`, and anything the project
+    *settings* exclude — dot files/folders unless explicitly tracked,
+    and explicit ``ignore`` entries.
+    """
+    st = settings if settings is not None else project_settings.Settings()
+    root = Path(root)
     out: list[Path] = []
-    stack: list[Path] = [Path(root)]
+    stack: list[Path] = [root]
     while stack:
         directory = stack.pop()
         try:
@@ -177,12 +278,24 @@ def iter_tracked_files(root: Path) -> list[Path]:
         except OSError:
             continue
         for entry in entries:
-            if entry.name.startswith("."):
+            if entry.name == SESS_DIR_NAME:
                 continue
+            rel = entry.relative_to(root).as_posix()
             if entry.is_dir():
-                if entry.name not in IGNORED_DIRS:
+                if (
+                    entry.name not in IGNORED_DIRS
+                    and (
+                        project_settings.should_track(st, rel)
+                        # or an excluded folder still holds tracked files
+                        # (a later, more specific ``track`` rule)
+                        or project_settings.can_have_tracked_below(st, rel)
+                    )
+                ):
                     stack.append(entry)
-            elif entry.is_file():
+                continue
+            if not project_settings.should_track(st, rel):
+                continue
+            if entry.is_file():
                 try:
                     if entry.stat().st_size <= MAX_TRACK_BYTES:
                         out.append(entry)
