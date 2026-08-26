@@ -24,7 +24,11 @@ async def test_open_nested_file_shows_its_content(project: Path) -> None:
         await u.wait_tree()
         await u.click_file("src/utils/helper.py")
         assert any("helper.py" in l for l in u.tab_labels())
-        assert u.active_area().text == (project / "src/utils/helper.py").read_text()
+        await u.wait_for(
+            lambda: u.active_area().text
+            == (project / "src/utils/helper.py").read_text(),
+            what="content loaded",
+        )
 
 
 async def test_edit_save_close_reopen(project: Path) -> None:
@@ -36,7 +40,10 @@ async def test_edit_save_close_reopen(project: Path) -> None:
         u = UI(app, pilot)
         await u.wait_tree()
         await u.click_file("notes.txt")
-        assert u.active_area().text == "remember the milk\n"
+        await u.wait_for(
+            lambda: u.active_area().text == "remember the milk\n",
+            what="content loaded",
+        )
 
         # genuine keystrokes: cursor to end-of-line, type a character
         await u.pilot.click(u.active_area())
@@ -56,7 +63,9 @@ async def test_edit_save_close_reopen(project: Path) -> None:
         await u.close_tab()
         assert not any("notes.txt" in l for l in u.tab_labels())
         await u.click_file("notes.txt")
-        assert u.active_area().text == new_text
+        await u.wait_for(
+            lambda: u.active_area().text == new_text, what="reopened content"
+        )
 
 
 async def test_switch_between_open_files(project: Path) -> None:
@@ -71,12 +80,19 @@ async def test_switch_between_open_files(project: Path) -> None:
         await u.click_file("config.json")
         assert any("app.js" in l for l in u.tab_labels())
         assert any("config.json" in l for l in u.tab_labels())
-        # the most recently opened file is active
-        assert u.active_area().text == u.disk("config.json")
+        # the most recently opened file is active (its load may still
+        # be settling when the tab label appears)
+        await u.wait_for(
+            lambda: u.active_area().text == u.disk("config.json"),
+            what="config.json loaded",
+        )
 
         # click app.js in the explorer again -> its tab comes forward
         await u.click_file("src/app.js")
-        assert u.active_area().text == u.disk("src/app.js")
+        await u.wait_for(
+            lambda: u.active_area().text == u.disk("src/app.js"),
+            what="app.js in front",
+        )
         # still two tabs, not three
         assert len(u.tab_labels()) == 2
 

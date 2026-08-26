@@ -141,6 +141,34 @@ class UI:
             lambda: self.screen_name() == "NodeMenuScreen", what="node menu"
         )
 
+    async def shift_click(self, node) -> None:
+        """Shift+click a node — start/extend the bulk selection range."""
+        region = self.ex()._get_label_region(node._line)
+        await self.pilot.click(
+            Explorer, offset=(region.x + 2, region.y), shift=True
+        )
+        await self.settle()
+
+    async def open_bulk_menu(self) -> None:
+        """Ctrl+click while a range of 2+ is selected — the bulk
+        Track/Untrack menu (any entry opens it in that state)."""
+        node = self.ex().root
+        region = self.ex()._get_label_region(node._line)
+        await self.pilot.click(
+            Explorer, offset=(region.x + 2, region.y), control=True
+        )
+        await self.wait_for(
+            lambda: self.screen_name() == "SelectionMenuScreen", what="bulk menu"
+        )
+
+    def has_button(self, selector: str) -> bool:
+        """Whether a button matching *selector* exists on the current screen."""
+        try:
+            self.app.screen.query_one(selector, Button)
+            return True
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ #
     # tabs & editor
     # ------------------------------------------------------------------ #

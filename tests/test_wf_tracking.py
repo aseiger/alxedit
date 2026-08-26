@@ -34,7 +34,10 @@ async def test_external_edit_approve_and_save(project_with_session: Path) -> Non
 
         # user has the file open
         await u.click_file("src/app.js")
-        assert u.active_area().text == "const a = 1;\n"
+        await u.wait_for(
+            lambda: u.active_area().text == "const a = 1;\n",
+            what="content loaded",
+        )
 
         # another program rewrites it
         u.ext_write("src/app.js", "const a = 42;\n")
@@ -49,7 +52,10 @@ async def test_external_edit_approve_and_save(project_with_session: Path) -> Non
         await u.approve_selected()
 
         # the open tab now shows the disk content, uncommitted (●)
-        assert u.active_area().text == "const a = 42;\n"
+        await u.wait_for(
+            lambda: u.active_area().text == "const a = 42;\n",
+            what="adopted content",
+        )
         assert any("●" in l for l in u.tab_labels())
 
         # saving commits it: no more dot, no more pending change
