@@ -298,7 +298,7 @@ async def test_explorer_annotates_tracked_and_untracked(repo: Path) -> None:
         assert " ○" in line_for(app, ".github")  # untracked dot folder
 
     # a 'track' rule flips the glyph
-    project_settings.save(repo, project_settings.Settings(track=(".hidden",)))
+    project_settings.save(repo, project_settings.Settings(rules=(("track", ".hidden"),)))
     app2 = AlxEditApp(root=repo)
     async with app2.run_test(size=(200, 30)) as pilot:
         await pilot.pause()
@@ -385,7 +385,7 @@ async def test_ctrl_click_toggle_tracking(repo: Path) -> None:
         assert app._is_tracked_path(repo / ".hidden")
         assert " T" in line_for(".hidden")
 
-        # 4. ... and now 'Untrack' works on it too (ignore wins)
+        # 4. ... and now 'Untrack' works on it too (the last rule wins)
         await _ctrl_click_node(pilot, app, ex, hnode)
         assert app.screen.__class__.__name__ == "NodeMenuScreen"
         app.screen.query_one("#menu-untrack", Button).press()
@@ -475,6 +475,105 @@ async def test_untracking_a_folder_creates_no_phantom_changes(repo: Path) -> Non
         app._watch_tick()
         await pilot.pause()
         assert (repo / "app.js") in app._changes
+
+
+async def test_folder_toggle_is_recursive_and_decisive(repo: Path) -> None:
+    """Folder Track/Untrack is recursive and decisive in both directions.
+
+    - a file can be carved back out of an untracked folder;
+    - untracking the folder again overrides that carve-out;
+    - tracking the folder brings back even specifically-ignored children.
+    """
+    app = AlxEditApp(root=repo)
+    async with app.run_test() as pilot:
+        # repo fixture already has src/hello.py; add two more files
+        (repo / "src" / "a.py").write_text("x")
+        (repo / "src" / "b.py").write_text("y")
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        def rc() -> str:
+            return (repo / ".alxeditrc").read_text()
+
+        async def find_node(ex: Explorer, name: str):
+            for _ in range(40):
+                node = next(
+                    (c for c in ex.root.children
+                     if c.data and c.data.path.name == name),
+                    None,
+                )
+                if node is not None:
+                    return node
+                await pilot.pause()
+            return None
+
+        async def press_menu(node, button: str) -> None:
+            await _ctrl_click_node(pilot, app, ex, node)
+            assert app.screen.__class__.__name__ == "NodeMenuScreen"
+            app.screen.query_one(button, Button).press()
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.pause()
+
+        async def src_node():
+            # re-resolved every time — a settings change may rebuild the tree
+            node = await find_node(ex, "src")
+            assert node is not None
+            if not node.children:
+                node.expand()  # lazy tree: children load on expand
+                for _ in range(40):
+                    if node.children:
+                        break
+                    await pilot.pause()
+                assert node.children
+            return node
+
+        async def toggle_src(button: str) -> None:
+            await press_menu(await src_node(), button)
+
+        async def toggle_file(name: str, button: str) -> None:
+            src = await src_node()
+            node = next(
+                c for c in src.children if c.data and c.data.path.name == name
+            )
+            await press_menu(node, button)
+
+        # 1. Untrack the folder — recursive: both files are excluded.
+        await toggle_src("#menu-untrack")
+        assert "ignore src" in rc()
+        assert not app._is_tracked_path(repo / "src" / "a.py")
+        assert not app._is_tracked_path(repo / "src" / "b.py")
+
+        # 2. Carve a file back out of the untracked folder.
+        await toggle_file("a.py", "#menu-track")
+        assert "track src/a.py" in rc()
+        assert app._is_tracked_path(repo / "src" / "a.py")
+        assert not app._is_tracked_path(repo / "src" / "b.py")
+
+        # 3. Untrack the folder again — decisive over the carve-out.
+        await toggle_src("#menu-untrack")
+        assert "track src/a.py" not in rc()
+        assert not app._is_tracked_path(repo / "src" / "a.py")
+        assert not app._is_tracked_path(repo / "src" / "b.py")
+
+        # 4. Track the folder back, exclude every file in it specifically,
+        #    then track the folder again: the folder action brings them
+        #    all back (recursive, decisive).
+        await toggle_src("#menu-track")
+        assert app._is_tracked_path(repo / "src" / "a.py")
+        assert app._is_tracked_path(repo / "src" / "b.py")
+        for name in ("a.py", "b.py", "hello.py"):  # hello.py is from the fixture
+            await toggle_file(name, "#menu-untrack")
+            assert not app._is_tracked_path(repo / "src" / name)
+        await toggle_src("#menu-track")
+        assert "ignore src/a.py" not in rc()
+        assert "ignore src/b.py" not in rc()
+        assert "ignore src/hello.py" not in rc()
+        assert app._is_tracked_path(repo / "src" / "a.py")
+        assert app._is_tracked_path(repo / "src" / "b.py")
+        assert app._is_tracked_path(repo / "src" / "hello.py")
 
 
 async def test_shift_click_range_selects_and_bulk_toggles(repo: Path) -> None:
@@ -2517,7 +2616,7 @@ async def test_tracked_dotfile_is_mirrored_and_flagged(repo: Path) -> None:
     """'track .env' opts it in: it lands in the mirror and external
     edits to it are reviewable."""
     (repo / ".env").write_text("A=1\n")
-    project_settings.save(repo, project_settings.Settings(track=(".env",)))
+    project_settings.save(repo, project_settings.Settings(rules=(("track", ".env"),)))
     shutil.rmtree(repo / ".alxedit")
     _new_session(repo)
     app = AlxEditApp(root=repo, paths=[repo / ".env"])
@@ -2540,7 +2639,7 @@ async def test_ignored_file_is_not_mirrored_nor_flagged(repo: Path) -> None:
     external edits to it are not flagged."""
     (repo / "assets").mkdir()
     (repo / "assets" / "big.png").write_text("fake-image-bytes" * 100)
-    project_settings.save(repo, project_settings.Settings(ignore=("assets",)))
+    project_settings.save(repo, project_settings.Settings(rules=(("ignore", "assets"),)))
     shutil.rmtree(repo / ".alxedit")
     _new_session(repo)
     app = AlxEditApp(root=repo)
@@ -2566,7 +2665,7 @@ async def test_ignoring_settles_a_pending_change(repo: Path) -> None:
         app._watch_tick()
         await pilot.pause()
         assert repo / "app.js" in app._changes
-        app._apply_settings(project_settings.Settings(ignore=("app.js",)))
+        app._apply_settings(project_settings.Settings(rules=(("ignore", "app.js"),)))
         await pilot.pause()
         assert repo / "app.js" not in app._changes
 

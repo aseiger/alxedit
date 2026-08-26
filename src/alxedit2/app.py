@@ -1406,7 +1406,10 @@ class SettingsScreen(ModalScreen[None]):
     async def _commit(self) -> None:
         """Persist + apply, then refresh the rows."""
         self._apply(
-            project_settings.Settings(tuple(self._ignore), tuple(self._track))
+            project_settings.Settings(
+                rules=tuple(("ignore", p) for p in self._ignore)
+                + tuple(("track", p) for p in self._track)
+            )
         )
         await self._refresh()
 
@@ -2629,11 +2632,16 @@ class AlxEditApp(App):
     def _set_tracked(self, path: Path, want: bool) -> None:
         """Add *path* to (or remove it from) the tracked list.
 
-        Edits ``.alxeditrc``: tracking a dot file/folder adds a
-        ``track`` rule; untracking anything adds an ``ignore`` rule
-        (which wins over everything). The active session's change list
-        is then re-derived — newly excluded files settle out of it,
-        newly included dot files may appear as changes.
+        Edits ``.alxeditrc``: a folder action clears every rule for the
+        folder and below it, then applies the new one — fully recursive
+        and decisive. A file action replaces the rules for that file
+        only (so it can be carved out of, or excluded from, a folder
+        rule; the last matching rule wins). Tracking writes an explicit
+        ``track`` rule only when the default or a broader rule would
+        leave the path untracked; untracking always writes an
+        ``ignore`` rule. The active session's change list is then
+        re-derived — newly excluded files settle out of it, newly
+        included dot files may appear as changes.
         """
         try:
             rel = project_settings.normalize(
@@ -2644,39 +2652,51 @@ class AlxEditApp(App):
             return
         if not rel:
             return
-        self._apply_settings(self._settings_toggled(self._settings, rel, want))
+        self._apply_settings(
+            self._settings_toggled(self._settings, rel, want, path.is_dir())
+        )
         self.notify(
             ("tracking " if want else "untracking ") + rel,
             title="Track",
         )
 
     def _settings_toggled(
-        self, cur: project_settings.Settings, rel: str, want: bool
+        self,
+        cur: project_settings.Settings,
+        rel: str,
+        want: bool,
+        is_folder: bool = False,
     ) -> project_settings.Settings:
         """Settings after one Track (*want*) / Untrack of root-relative
-        *rel*: tracking removes any ``ignore`` and (for dot paths) adds a
-        ``track`` rule; untracking adds an ``ignore`` (which wins over
-        everything) and drops a matching ``track``."""
+        *rel*.
 
-        def _without(entries: tuple, entry: str) -> tuple:
-            return tuple(e for e in entries if e.casefold() != entry.casefold())
-
-        def _add_unique(entries: tuple, entry: str) -> tuple:
-            if any(e.casefold() == entry.casefold() for e in entries):
-                return entries
-            return entries + (entry,)
-
+        For a *folder*, every rule for the folder itself or a path below
+        it is dropped first, so the action is fully recursive and
+        decisive (tracking a folder brings back previously excluded
+        children; untracking one clears earlier per-file carves-out).
+        For a *file*, only its own rules are replaced — it becomes the
+        last (winning) rule for that path, which is how files are carved
+        out of, or excluded from, folder rules. An explicit ``track``
+        rule is only written when the default or a broader rule would
+        otherwise leave the path untracked (dot paths, files inside an
+        ignored folder); untracking always writes an ``ignore``."""
+        r = rel.casefold()
+        rules: list[tuple[str, str]] = []
+        for verb, path in cur.rules:
+            p = path.casefold()
+            if p == r:
+                continue
+            if is_folder and p.startswith(r + "/"):
+                continue  # the folder action overrides everything below
+            rules.append((verb, path))
         if want:
-            ignore = _without(cur.ignore, rel)
-            track = (
-                _add_unique(cur.track, rel)
-                if project_settings.is_dot(rel)
-                else cur.track
-            )
+            if not project_settings.should_track(
+                project_settings.Settings(rules=tuple(rules)), rel
+            ):
+                rules.append(("track", rel))
         else:
-            ignore = _add_unique(cur.ignore, rel)
-            track = _without(cur.track, rel)
-        return project_settings.Settings(ignore=ignore, track=track)
+            rules.append(("ignore", rel))
+        return project_settings.Settings(rules=tuple(rules))
 
     def _set_tracked_many(self, paths: list[Path], want: bool) -> None:
         """Track/Untrack a batch of paths in a single settings write
@@ -2693,7 +2713,7 @@ class AlxEditApp(App):
                 continue
             if not rel or rel.split("/")[0] == sessions.SESS_DIR_NAME:
                 continue
-            st = self._settings_toggled(st, rel, want)
+            st = self._settings_toggled(st, rel, want, path.is_dir())
             count += 1
         if not count:
             self.notify("nothing applicable in the selection", title="Track")

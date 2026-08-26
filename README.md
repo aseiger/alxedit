@@ -142,8 +142,17 @@ covers:
   copied into every session.
 
 Paths are relative to the project root and case-insensitive. A folder
-entry covers everything below it, and `ignore` wins over `track`. Paths
-may also be **globs** — an entry containing `*`, `?`, or `[` matches as a
+entry is **recursive** — it covers everything below it — and when
+several rules match a path the **last one wins**: the most recent
+Track/Untrack is the one in effect, so a folder action is always
+decisive and you can still pick individual files back out afterwards:
+
+```
+ignore src        # untrack the whole folder (recursive)
+track  src/app.py # ...but keep this one file
+```
+
+Paths may also be **globs** — an entry containing `*`, `?`, or `[` matches as a
 glob against the relative path *and* each of its folder prefixes (so `*`
 crosses directory boundaries):
 
@@ -184,9 +193,10 @@ blue) means the change tracker covers it — it is in the session mirror
 `ignore` rule in `.alxeditrc`). Folders reflect their contents: `T`
 when anything inside is tracked, `○` when nothing is. Flip a rule in
 Settings — or right from the tree: **ctrl+click an entry and pick
-Track / Untrack** — and the glyphs follow. Untracking adds an `ignore`
-rule; tracking a dot file/folder adds a `track` rule. Both land in
-`.alxeditrc`.
+Track / Untrack** — and the glyphs follow. Each action rewrites the
+rule for that path so it becomes the last (winning) one — folder rules
+are recursive, and a file can be picked back out of an untracked folder.
+Everything lands in `.alxeditrc`.
 
 If the file is already open, the tab **immediately switches to a diff
 review** — there is no separate diff window. Both sides are painted into

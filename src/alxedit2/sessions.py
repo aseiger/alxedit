@@ -281,12 +281,21 @@ def iter_tracked_files(
             if entry.name == SESS_DIR_NAME:
                 continue
             rel = entry.relative_to(root).as_posix()
+            if entry.is_dir():
+                if (
+                    entry.name not in IGNORED_DIRS
+                    and (
+                        project_settings.should_track(st, rel)
+                        # or an excluded folder still holds tracked files
+                        # (a later, more specific ``track`` rule)
+                        or project_settings.can_have_tracked_below(st, rel)
+                    )
+                ):
+                    stack.append(entry)
+                continue
             if not project_settings.should_track(st, rel):
                 continue
-            if entry.is_dir():
-                if entry.name not in IGNORED_DIRS:
-                    stack.append(entry)
-            elif entry.is_file():
+            if entry.is_file():
                 try:
                     if entry.stat().st_size <= MAX_TRACK_BYTES:
                         out.append(entry)

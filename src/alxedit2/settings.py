@@ -7,21 +7,30 @@ The file is plain text (also hand-editable), one directive per line,
     track  <path>   mirror/track this dot file/dot folder despite the default
 
 Paths are relative to the project root, ``/``-separated, case-insensitive.
-A literal entry matches the file or folder itself and, for a folder,
-everything below it. An entry containing glob characters (``*``, ``?``,
-``[``) is matched as a glob against the relative path *and* each of its
-folder prefixes, so ``*`` also crosses directory boundaries::
+A rule on a folder is **recursive**: it covers the folder and everything
+below it.
+
+Precedence: rules are evaluated in file order and the **last matching
+rule wins** — the most recent Track/Untrack on a path is the one in
+effect (like later lines overriding earlier ones in ``.gitignore``).
+So untracking a folder is always decisive, and you can still pick
+individual files back out of an ignored folder afterwards::
+
+    ignore src        # untrack the whole folder (recursive)
+    track src/app.py  # ...but keep this one file
+
+Entries may use glob characters (``*``, ``?``, ``[``); ``*`` crosses
+directory boundaries::
 
     ignore *.log      every .log file, wherever it is
     ignore dist/*     everything under dist/
     track  .github/*  the workflows inside the dot folder
 
-Defaults (no file, or no directive for a path):
+Defaults (no rule matches the path):
 
 - regular files and folders are tracked;
 - dot files and dot folders (``.env``, ``.github/``, ...) are **not**
-  tracked unless listed with ``track``;
-- ``ignore`` always wins.
+  tracked unless listed with ``track``.
 
 "Tracked" means: copied into the session mirror (the diff/revert
 baseline) and included in change tracking. The explorer always shows
@@ -37,13 +46,30 @@ from pathlib import Path
 #: Name of the per-project settings file.
 RC_NAME = ".alxeditrc"
 
+#: One rule: ``("ignore" | "track", normalized root-relative path)``.
+Rule = tuple[str, str]
+
 
 @dataclass(frozen=True)
 class Settings:
-    """A parsed ``.alxeditrc``: normalized ignore/track path lists."""
+    """A parsed ``.alxeditrc`` as an ordered list of rules.
 
-    ignore: tuple[str, ...] = ()
-    track: tuple[str, ...] = ()
+    The LAST rule matching a path is the one that applies (most recent
+    action wins); a rule on a folder covers everything below it. With
+    no matching rule, regular paths are tracked and dot paths are not.
+    """
+
+    rules: tuple[Rule, ...] = ()
+
+    @property
+    def ignore(self) -> tuple[str, ...]:
+        """The ``ignore`` paths, in rule order (for display and compat)."""
+        return tuple(path for verb, path in self.rules if verb == "ignore")
+
+    @property
+    def track(self) -> tuple[str, ...]:
+        """The ``track`` paths, in rule order (for display and compat)."""
+        return tuple(path for verb, path in self.rules if verb == "track")
 
 
 def normalize(entry: str | Path) -> str:
@@ -97,22 +123,47 @@ def is_dot(rel: str) -> bool:
 
 
 def should_track(settings: Settings, rel: str) -> bool:
-    """Whether a root-relative path is mirrored/tracked."""
-    if any(_matches(entry, rel) for entry in settings.ignore):
-        return False
-    if is_dot(rel):
-        return any(_matches(entry, rel) for entry in settings.track)
-    return True
+    """Whether a root-relative path is mirrored/tracked.
+
+    The last matching rule in file order wins (most recent action);
+    with no matching rule, dot paths are untracked and everything
+    else is tracked.
+    """
+    decision: str | None = None
+    for verb, entry in settings.rules:
+        if _matches(entry, rel):
+            decision = verb
+    if decision is None:
+        return not is_dot(rel)
+    return decision == "track"
+
+
+def can_have_tracked_below(settings: Settings, rel: str) -> bool:
+    """Whether any ``track`` rule could cover a path *below* *rel*.
+
+    Lets the mirror walk decide that an excluded folder can still
+    contain tracked files (a later, more specific ``track``) and must
+    be descended into.
+    """
+    r = rel.casefold()
+    for verb, entry in settings.rules:
+        if verb != "track":
+            continue
+        if _is_glob(entry):
+            return True  # conservative: a glob might reach below
+        if entry.casefold().startswith(r + "/"):
+            return True
+    return False
 
 
 def parse(text: str) -> Settings:
-    """Parse ``.alxeditrc`` content. Unknown directives and invalid
-    entries (empty, escaping the root) are skipped.
+    """Parse ``.alxeditrc`` content into an ordered rule list.
 
-    Glob characters (``*``, ``?``, ``[``) are allowed in the path and
+    Unknown directives and invalid entries (empty, escaping the root)
+    are skipped. File order is preserved — it decides precedence (the
+    last matching rule wins). Glob characters (``*``, ``?``, ``[``)
     make the entry match as a glob (see :func:`_matches`)."""
-    ignore: list[str] = []
-    track: list[str] = []
+    rules: list[Rule] = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -124,11 +175,10 @@ def parse(text: str) -> Settings:
         if not arg or ".." in arg.split("/"):
             continue
         if verb == "ignore":
-            ignore.append(arg)
+            rules.append(("ignore", arg))
         elif verb == "track":
-            track.append(arg)
-    # de-duplicate, keep order
-    return Settings(tuple(dict.fromkeys(ignore)), tuple(dict.fromkeys(track)))
+            rules.append(("track", arg))
+    return Settings(rules=tuple(rules))
 
 
 def load(root: Path) -> Settings:
@@ -140,18 +190,19 @@ def load(root: Path) -> Settings:
 
 
 def save(root: Path, settings: Settings) -> None:
-    """Write ``<root>/.alxeditrc`` (round-trips :func:`load`)."""
+    """Write ``.alxeditrc`` (round-trips :func:`load`)."""
     lines = [
         "# alxedit2 project settings",
         "# the explorer always shows every file; these control what the",
         "# session mirror (diff/revert baseline) tracks",
         "#",
         "# ignore <path>  never mirror/track this file or folder",
-        "# track  <path>  mirror/track this dot file/dot folder despite the default",
+        "# track  <path>  mirror/track this despite the default",
+        "# a rule on a folder covers everything below it, and the LAST",
+        "# rule for a path wins — e.g. 'ignore build' then 'track build/app.py'",
         "# paths may use globs (* ? [..]) that also match across folders,",
         "# e.g. 'ignore *.log' or 'track .github/*'",
         "",
     ]
-    lines += [f"ignore {entry}" for entry in settings.ignore]
-    lines += [f"track {entry}" for entry in settings.track]
+    lines += [f"{verb} {path}" for verb, path in settings.rules]
     (Path(root) / RC_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
