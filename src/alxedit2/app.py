@@ -894,7 +894,8 @@ class HelpScreen(ModalScreen[None]):
             "Settings btn  top bar — what the session mirror tracks\n"
             "              (ctrl+.): the explorer always shows every\n"
             "              file; 'ignore' excludes any file/folder,\n"
-            "              'track' includes dot files (off by default)\n"
+            "              'track' includes dot files (off by default);\n"
+            "              paths may be globs: *.log, dist/*, .github/*\n"
             "Tree glyphs     T = the change tracker covers this file/folder\n"
             "                ○ = untracked (dot files by default, or an\n"
             "                'ignore' rule); folders reflect their contents\n"
@@ -1146,7 +1147,9 @@ class SettingsScreen(ModalScreen[None]):
 
     - dot files/folders are untracked by default — "Track" includes a
       specific one (e.g. ``.env``);
-    - "Ignore" excludes any file or folder (e.g. a massive image).
+    - "Ignore" excludes any file or folder (e.g. a massive image);
+    - a path may be a glob (``*.log``, ``dist/*``) that also matches
+      across folders.
 
     Changes persist immediately and re-reconcile the active session.
     """
@@ -1228,7 +1231,7 @@ class SettingsScreen(ModalScreen[None]):
         yield Vertical(id="settings-body")
         with Horizontal(classes="settings--add"):
             yield Input(
-                placeholder="path inside the project, e.g. assets/images or .env",
+                placeholder="path or glob, e.g. assets/images, .env, *.log",
                 id="settings-path",
             )
             yield Button("Ignore", id="settings-add-ignore")

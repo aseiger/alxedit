@@ -135,10 +135,20 @@ covers:
 - `ignore` opts anything out — e.g. a massive image you don't want
   copied into every session.
 
-Paths are relative to the project root, case-insensitive; a folder entry
-covers everything below it; `ignore` wins over `track`. Changes apply
-immediately (new sessions use them right away; the active session's
-change list is re-reconciled).
+Paths are relative to the project root and case-insensitive. A folder
+entry covers everything below it, and `ignore` wins over `track`. Paths
+may also be **globs** — an entry containing `*`, `?`, or `[` matches as a
+glob against the relative path *and* each of its folder prefixes (so `*`
+crosses directory boundaries):
+
+```
+ignore *.log      # every .log file, wherever it is
+ignore dist/*     # everything under dist/
+track  .github/*  # include the workflows in a dot folder
+```
+
+Changes apply immediately (new sessions use them right away; the active
+session's change list is re-reconciled).
 
 ## External change tracking (AI-agent aware)
 

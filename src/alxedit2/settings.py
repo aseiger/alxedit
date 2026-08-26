@@ -7,8 +7,14 @@ The file is plain text (also hand-editable), one directive per line,
     track  <path>   mirror/track this dot file/dot folder despite the default
 
 Paths are relative to the project root, ``/``-separated, case-insensitive.
-An entry matches the file or folder itself and, for a folder, everything
-below it.
+A literal entry matches the file or folder itself and, for a folder,
+everything below it. An entry containing glob characters (``*``, ``?``,
+``[``) is matched as a glob against the relative path *and* each of its
+folder prefixes, so ``*`` also crosses directory boundaries::
+
+    ignore *.log      every .log file, wherever it is
+    ignore dist/*     everything under dist/
+    track  .github/*  the workflows inside the dot folder
 
 Defaults (no file, or no directive for a path):
 
@@ -24,6 +30,7 @@ every file regardless of tracking.
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,9 +57,36 @@ def normalize(entry: str | Path) -> str:
     return "/".join(parts)
 
 
+def _is_glob(entry: str) -> bool:
+    """True if the entry uses glob characters (``*``, ``?``, ``[``)."""
+    return any(ch in entry for ch in ("*", "?", "["))
+
+
+def _glob_match(entry: str, rel: str) -> bool:
+    """Glob-match *rel* against *entry*.
+
+    The relative path itself and each of its folder prefixes are tried,
+    and ``*`` crosses directory boundaries (fnmatch semantics), so
+    ``*.log`` catches ``src/deep/a.log`` and ``dist/*`` catches
+    ``dist/x/y.js``. Case-insensitive (Windows paths).
+    """
+    pattern = entry.casefold()
+    parts = rel.casefold().split("/")
+    for i in range(len(parts), 0, -1):
+        if fnmatch.fnmatchcase("/".join(parts[:i]), pattern):
+            return True
+    return False
+
+
 def _matches(entry: str, rel: str) -> bool:
-    """True if *rel* (root-relative, ``/``-separated) is *entry* itself or
-    below it. Case-insensitive (Windows paths)."""
+    """Whether the rule *entry* covers *rel* (root-relative, ``/``-separated).
+
+    Literal entries match the path itself or anything below it; glob
+    entries (see :func:`_is_glob`) match the path or a folder prefix
+    against the glob. Case-insensitive (Windows paths).
+    """
+    if _is_glob(entry):
+        return _glob_match(entry, rel)
     e, r = entry.casefold(), rel.casefold()
     return r == e or r.startswith(e + "/")
 
@@ -73,7 +107,10 @@ def should_track(settings: Settings, rel: str) -> bool:
 
 def parse(text: str) -> Settings:
     """Parse ``.alxeditrc`` content. Unknown directives and invalid
-    entries (empty, escaping the root) are skipped."""
+    entries (empty, escaping the root) are skipped.
+
+    Glob characters (``*``, ``?``, ``[``) are allowed in the path and
+    make the entry match as a glob (see :func:`_matches`)."""
     ignore: list[str] = []
     track: list[str] = []
     for raw in text.splitlines():
@@ -111,6 +148,8 @@ def save(root: Path, settings: Settings) -> None:
         "#",
         "# ignore <path>  never mirror/track this file or folder",
         "# track  <path>  mirror/track this dot file/dot folder despite the default",
+        "# paths may use globs (* ? [..]) that also match across folders,",
+        "# e.g. 'ignore *.log' or 'track .github/*'",
         "",
     ]
     lines += [f"ignore {entry}" for entry in settings.ignore]
