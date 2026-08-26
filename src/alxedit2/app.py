@@ -327,6 +327,7 @@ class Explorer(DirectoryTree):
         "explorer--marker-del",
         "explorer--tracked",
         "explorer--untracked",
+        "explorer--selected",
     }
 
     DEFAULT_CSS = """
@@ -349,6 +350,11 @@ class Explorer(DirectoryTree):
         & > .explorer--untracked {
             color: $text-muted;
         }
+
+        & > .explorer--selected {
+            color: $accent;
+            text-style: bold underline;
+        }
     }
     """
 
@@ -369,9 +375,11 @@ class Explorer(DirectoryTree):
         unsaved_paths = getattr(self.app, "_unsaved_paths", None)
         if unsaved_paths and entry.path in unsaved_paths:
             text.stylize("bold #ffa62b")  # mutates in place; returns None
-        # Tracking glyph: does the change tracker cover this entry?
+        # Selection mark (shift+click range), then the tracking glyph.
         parts: list[tuple[str, str]] = []
         app = self.app
+        if app is not None and entry.path in getattr(app, "_selection", ()):
+            parts.append(("  ✓", "explorer--selected"))
         if app is not None and hasattr(app, "_is_tracked_path"):
             if app._is_tracked_path(entry.path):
                 parts.append(("  T", "explorer--tracked"))
@@ -412,19 +420,35 @@ class Explorer(DirectoryTree):
         return text
 
     async def _on_click(self, event: events.Click) -> None:
-        """Control-click opens the node's context menu (rename / delete /
-        new file / new folder) instead of the tree's select/expand.
+        """Mouse actions on explorer entries.
+
+        - plain click: clear any range selection, then the tree's normal
+          select/expand/open behavior (falls through to DirectoryTree);
+        - shift+click: set/extend the selection range (last clicked
+          entry → this one) — for the bulk Track/Untrack menu;
+        - ctrl+click: the node's context menu (rename / delete / track /
+          untrack / new file / new folder), or the bulk menu when a
+          range of two or more entries is selected.
 
         Textual dispatches ``_on_click`` up the whole MRO, so ours runs
         before DirectoryTree's; ``prevent_default`` stops the walk so the
         tree's select/expand (and the file open) never happens.
-        Plain clicks fall through to the tree's own handler.
         """
         if event.ctrl:
             event.prevent_default()
             node = self.get_node_at_line(event.style.meta.get("line", -1))
             if node is not None:
-                self.app.action_node_menu(node)
+                if len(self.app._selection) > 1:
+                    self.app.action_selection_menu()
+                else:
+                    self.app.action_node_menu(node)
+        elif event.shift:
+            event.prevent_default()
+            node = self.get_node_at_line(event.style.meta.get("line", -1))
+            if node is not None:
+                self.app._select_range(node)
+        else:
+            self.app._clear_selection()
 
 
 def display_path(path: Path) -> str:
@@ -851,6 +875,71 @@ class NodeMenuScreen(ModalScreen[str]):
         self.dismiss(mapping.get(event.button.id, "cancel"))
 
 
+class SelectionMenuScreen(ModalScreen[str]):
+    """Bulk context menu for an explorer range selection (shift+click).
+
+    Dismisses with ``"track"``, ``"untrack"``, ``"clear"``, or
+    ``"cancel"``: apply Track/Untrack to every selected path (one
+    ``.alxeditrc`` write, one re-snapshot), or drop the selection.
+    """
+
+    CSS = """
+    SelectionMenuScreen {
+        align: center middle;
+        height: auto;
+        width: auto;
+        min-width: 56;
+    }
+    SelectionMenuScreen .menu--title {
+        padding: 0 2 1 2;
+        text-style: bold;
+    }
+    SelectionMenuScreen .menu--hint {
+        padding: 0 2 1 2;
+        width: 46;
+        color: $text-muted;
+    }
+    SelectionMenuScreen .menu--buttons {
+        height: 3;
+        align: center middle;
+    }
+    SelectionMenuScreen Button {
+        width: 14;
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, paths: list[Path]) -> None:
+        super().__init__()
+        self._paths = list(paths)
+
+    def compose(self) -> ComposeResult:
+        n = len(self._paths)
+        first = display_path(self._paths[0])
+        with Vertical(classes="menu--box"):
+            yield Label(f"{n} selected", classes="menu--title")
+            if n > 1:
+                yield Label(
+                    f"{first}  … +{n - 1} more", classes="menu--hint"
+                )
+            else:
+                yield Label(first, classes="menu--hint")
+            with Horizontal(classes="menu--buttons"):
+                yield Button(f"Track ({n})", id="sel-track")
+                yield Button(f"Untrack ({n})", id="sel-untrack")
+            with Horizontal(classes="menu--buttons"):
+                yield Button("Clear", id="sel-clear")
+                yield Button("Cancel", id="sel-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        mapping = {
+            "sel-track": "track",
+            "sel-untrack": "untrack",
+            "sel-clear": "clear",
+        }
+        self.dismiss(mapping.get(event.button.id, "cancel"))
+
+
 class HelpScreen(ModalScreen[None]):
     """Quick reference for keys and mouse actions."""
 
@@ -880,6 +969,9 @@ class HelpScreen(ModalScreen[None]):
             "ctrl+click    file/folder menu — rename, delete, track /\n"
             "              untrack, or create a new file/folder there\n"
             "              (mouse-first)\n"
+            "shift+click   select a range of entries (from the last\n"
+            "              clicked one); ctrl+click then opens the bulk\n"
+            "              menu: Track (N) / Untrack (N) / Clear\n"
             "ctrl+shift+n  new folder where the cursor is (hotkey)\n"
             "ctrl+shift+x  delete the highlighted folder (hotkey)\n"
             "f2            external changes — approve or reject them\n"
@@ -900,6 +992,7 @@ class HelpScreen(ModalScreen[None]):
             "Tree glyphs     T = the change tracker covers this file/folder\n"
             "                ○ = untracked (dot files by default, or an\n"
             "                'ignore' rule); folders reflect their contents\n"
+            "                ✓ = part of a shift+click selection (bulk)\n"
             "                +N/-M = pending external change (green/red)\n"
             "                ctrl+click an entry: Track / Untrack it\n"
             "esc / ctrl+d  abandon a review (keeps your side; reviews\n"
@@ -1645,6 +1738,10 @@ class AlxEditApp(App):
         #: path -> tracked external change.
         self._changes: dict[Path, ChangeRecord] = {}
         self._tree_markers: dict[Path, tuple[int, int]] = {}
+        #: Explorer range selection (shift+click), for bulk Track/Untrack:
+        #: the anchor entry and the selected paths in visible tree order.
+        self._sel_anchor: Optional[Path] = None
+        self._selection: list[Path] = []
         #: path -> monotonic time of our own write (self-write guard).
         self._self_writes: dict[Path, float] = {}
         self._change_listeners: set = set()
@@ -2155,6 +2252,72 @@ class AlxEditApp(App):
             node = self._current_node()
         self._run_modal(self._do_node_menu(node, tree.root is node))
 
+    def action_selection_menu(self) -> None:
+        """Open the bulk menu for the current explorer selection.
+
+        (shift+click builds the selection; this is the ctrl+click
+        follow-up when two or more entries are selected.)
+        """
+        if len(self._selection) > 1:
+            self._run_modal(self._do_selection_menu())
+
+    async def _do_selection_menu(self) -> None:
+        choice = await self.push_screen_wait(
+            SelectionMenuScreen(list(self._selection))
+        )
+        if choice in ("track", "untrack"):
+            self._set_tracked_many(list(self._selection), choice == "track")
+            self._clear_selection()
+        elif choice == "clear":
+            self._clear_selection()
+
+    def _select_range(self, node) -> None:
+        """Shift+click: select the visible range between the last clicked
+        entry and *node* (inclusive) — for the bulk Track/Untrack menu.
+
+        The first shift+click starts the selection at that entry; each
+        following one re-ranges from the anchor to the new entry.
+        """
+        tree = self.query_one(Explorer)
+        path = node.data.path if node.data is not None else self.root
+        order: list[Path] = []
+
+        def walk(n) -> None:
+            if n.data is not None:
+                order.append(n.data.path)
+            for child in n.children:
+                walk(child)
+
+        walk(tree.root)
+        try:
+            i = (
+                order.index(self._sel_anchor)
+                if self._sel_anchor is not None
+                else -1
+            )
+            j = order.index(path)
+        except ValueError:
+            i = j = -1
+        if i == -1 or i == j or j == -1:
+            self._sel_anchor = path
+            self._selection = [path]
+        else:
+            lo, hi = sorted((i, j))
+            self._selection = order[lo : hi + 1]
+            self._sel_anchor = path
+        self._refresh_tree_markers()  # repaints the tree (✓ marks)
+        self.notify(
+            f"{len(self._selection)} selected — ctrl+click for Track/Untrack",
+            title="Select",
+        )
+
+    def _clear_selection(self) -> None:
+        """Drop the explorer range selection (plain click / after apply)."""
+        if self._selection or self._sel_anchor is not None:
+            self._selection = []
+            self._sel_anchor = None
+            self._refresh_tree_markers()
+
     async def _do_node_menu(self, node, is_root: bool) -> None:
         choice = await self.push_screen_wait(NodeMenuScreen(node.data.path, is_root))
         if choice == "rename":
@@ -2481,7 +2644,19 @@ class AlxEditApp(App):
             return
         if not rel:
             return
-        cur = self._settings
+        self._apply_settings(self._settings_toggled(self._settings, rel, want))
+        self.notify(
+            ("tracking " if want else "untracking ") + rel,
+            title="Track",
+        )
+
+    def _settings_toggled(
+        self, cur: project_settings.Settings, rel: str, want: bool
+    ) -> project_settings.Settings:
+        """Settings after one Track (*want*) / Untrack of root-relative
+        *rel*: tracking removes any ``ignore`` and (for dot paths) adds a
+        ``track`` rule; untracking adds an ``ignore`` (which wins over
+        everything) and drops a matching ``track``."""
 
         def _without(entries: tuple, entry: str) -> tuple:
             return tuple(e for e in entries if e.casefold() != entry.casefold())
@@ -2501,9 +2676,31 @@ class AlxEditApp(App):
         else:
             ignore = _add_unique(cur.ignore, rel)
             track = _without(cur.track, rel)
-        self._apply_settings(project_settings.Settings(ignore=ignore, track=track))
+        return project_settings.Settings(ignore=ignore, track=track)
+
+    def _set_tracked_many(self, paths: list[Path], want: bool) -> None:
+        """Track/Untrack a batch of paths in a single settings write
+        (the shift+click bulk menu). The project root and session-store
+        entries are skipped; the change list re-derives only once."""
+        st = self._settings
+        count = 0
+        for path in paths:
+            try:
+                rel = project_settings.normalize(
+                    path.resolve().relative_to(self.root.resolve())
+                )
+            except ValueError:
+                continue
+            if not rel or rel.split("/")[0] == sessions.SESS_DIR_NAME:
+                continue
+            st = self._settings_toggled(st, rel, want)
+            count += 1
+        if not count:
+            self.notify("nothing applicable in the selection", title="Track")
+            return
+        self._apply_settings(st)
         self.notify(
-            ("tracking " if want else "untracking ") + rel,
+            f"{'tracking' if want else 'untracking'} {count} path(s)",
             title="Track",
         )
 

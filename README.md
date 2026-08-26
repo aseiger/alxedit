@@ -62,6 +62,7 @@ alxedit2 --root ~/src/myproject main.py   # explicit working dir + a file
 | `ctrl+s`        | Save (save-as if untitled)      |
 | `ctrl+shift+s`  | Save as…                        |
 | `ctrl+click` (explorer) | File/folder menu — **Rename**, **Delete**, **Track**/**Untrack** (edit `.alxeditrc`), **New file here**, **New folder here**. Files: "here" = its folder. Folders: "here" = inside them |
+| `shift+click` (explorer) | Select a range of files/folders (from the last clicked entry — marked ✓). Then `ctrl+click` opens the **bulk** menu: **Track (N)** / **Untrack (N)** / **Clear** — one `.alxeditrc` write for the whole range |
 | `ctrl+shift+n`  | New folder where the cursor is (hotkey alternative) |
 | `ctrl+shift+x`  | Delete highlighted folder (hotkey alternative; tracked files inside stay revertable) |
 | `f4` / `ctrl+w` | Close tab                       |

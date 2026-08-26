@@ -421,6 +421,109 @@ async def test_ctrl_click_toggle_tracking(repo: Path) -> None:
         assert " T" in line_for("src")
 
 
+async def test_shift_click_range_selects_and_bulk_toggles(repo: Path) -> None:
+    """shift+click selects a range of entries (✓ marks); ctrl+click then
+    opens the bulk menu, and Track/Untrack applies to the whole range in
+    one ``.alxeditrc`` write; a plain click clears the selection."""
+
+    async def find_node(ex: Explorer, name: str):
+        for _ in range(40):
+            node = next(
+                (c for c in ex.root.children if c.data and c.data.path.name == name),
+                None,
+            )
+            if node is not None:
+                return node
+            await pilot.pause()
+        return None
+
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        ex = app.query_one(Explorer)
+        await _wait_for(pilot, lambda: bool(ex.root.children))
+        for _ in range(10):
+            await pilot.pause()
+
+        def shift_click(node):
+            region = ex._get_label_region(node._line)
+            return pilot.click(
+                Explorer, offset=(region.x + 2, region.y), shift=True
+            )
+
+        def rc() -> str:
+            return (repo / ".alxeditrc").read_text()
+
+        def row_for(name: str) -> str:
+            for strip in app.screen._compositor.render_strips(app.screen.size):
+                t = strip.text.rstrip()
+                if ("📄" in t or "📁" in t) and name in t:
+                    return t
+            return ""
+
+        a = await find_node(ex, "app.js")
+        r = await find_node(ex, "README.md")
+        assert a is not None and r is not None
+
+        # 1. first shift+click: a one-entry selection, marked ✓
+        await shift_click(a)
+        assert app._selection and app._selection[0].name == "app.js"
+        assert "✓" in row_for("app.js")
+
+        # 2. second shift+click: the range from the anchor to here
+        await shift_click(r)
+        names = {p.name for p in app._selection}
+        assert {"app.js", "README.md"} <= names
+        assert len(app._selection) >= 2
+        n = len(app._selection)
+
+        # 3. ctrl+click -> the bulk menu, labelled with the count
+        await _ctrl_click_node(pilot, app, ex, r)
+        assert app.screen.__class__.__name__ == "SelectionMenuScreen"
+        labels = {b.label.plain for b in app.screen.query(Button)}
+        assert f"Track ({n})" in labels
+        assert f"Untrack ({n})" in labels
+
+        # 4. Untrack: one settings write, ignore rules for every
+        #    applicable entry in the range
+        app.screen.query_one("#sel-untrack", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" in rc()
+        assert "ignore README.md" in rc()
+        assert not app._is_tracked_path(repo / "app.js")
+        assert not app._is_tracked_path(repo / "README.md")
+        assert "○" in row_for("app.js")
+
+        # 5. the selection is cleared after applying
+        assert app._selection == [] and app._sel_anchor is None
+        assert "✓" not in row_for("app.js")
+
+        # 6. select again and bulk-Track -> the rules come back off
+        await shift_click(a)
+        await shift_click(r)
+        await _ctrl_click_node(pilot, app, ex, r)
+        assert app.screen.__class__.__name__ == "SelectionMenuScreen"
+        app.screen.query_one("#sel-track", Button).press()
+        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+        assert "ignore app.js" not in rc()
+        assert "ignore README.md" not in rc()
+        assert app._is_tracked_path(repo / "app.js")
+        assert app._is_tracked_path(repo / "README.md")
+        assert "T" in row_for("app.js")
+
+        # 7. a plain click drops the selection again
+        await shift_click(a)
+        assert app._selection
+        region = ex._get_label_region(r._line)
+        await pilot.click(Explorer, offset=(region.x + 2, region.y))
+        await pilot.pause()
+        assert app._selection == []
+        assert "✓" not in row_for("app.js")
+
+
 async def test_ctrl_click_menu_on_session_store_is_readonly(repo: Path) -> None:
     """Ctrl+click an entry inside .alxedit offers no file operations —
     the baseline copy must not be renamed, deleted, tracked, or created
@@ -829,6 +932,16 @@ async def test_explorer_refreshes_on_session_create_and_delete(repo: Path) -> No
                 return set()
         return {c.data.path.name for c in node.children if c.data is not None}
 
+    async def wait_kids(want: set) -> bool:
+        """Retry until the store's children cover *want* — the tree
+        reloads asynchronously after a session create/delete, so a single
+        read can land mid-reload (empty children)."""
+        for _ in range(60):
+            if want <= await store_children(ex):
+                return True
+            await pilot.pause()
+        return want <= await store_children(ex)
+
     app = AlxEditApp(root=repo)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
@@ -849,8 +962,7 @@ async def test_explorer_refreshes_on_session_create_and_delete(repo: Path) -> No
             tries=60,
         )
         s1 = app.session_id
-        assert s0 in await store_children(ex)
-        assert s1 in await store_children(ex)
+        assert await wait_kids({s0, s1})
 
         # 2. delete s0 (not the active one): it leaves the explorer too
         app.action_sessions()
@@ -863,7 +975,12 @@ async def test_explorer_refreshes_on_session_create_and_delete(repo: Path) -> No
         assert not (repo / ".alxedit" / s0).exists()
         app.screen.query_one("#sess-cancel", Button).press()
         await pilot.pause()
-        kids = await store_children(ex)
+        kids: set = set()
+        for _ in range(60):
+            kids = await store_children(ex)
+            if s1 in kids and s0 not in kids:
+                break
+            await pilot.pause()
         assert s1 in kids
         assert s0 not in kids
 
