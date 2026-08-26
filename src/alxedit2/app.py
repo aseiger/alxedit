@@ -886,7 +886,8 @@ class HelpScreen(ModalScreen[None]):
             "              (a approve · r reject · A approve all · R reject all)\n"
             "Session btn   top bar — switch / create / delete sessions\n"
             "              (each session snapshots the folder as the\n"
-            "              baseline for diffs & reverts)\n"
+            "              baseline for diffs & reverts); each row shows\n"
+            "              the tree vs. that baseline: in sync / +A/-B\n"
             "              note: without a .alxedit folder alxedit2\n"
             "              starts as a plain editor — no tree copy,\n"
             "              no tracked changes. Press this to start\n"
@@ -1069,6 +1070,17 @@ class SessionScreen(ModalScreen[SessionChoice]):
             label.append(s.label, style="bold" if active else "")
             label.append(f"  ·  {s.created[:16].replace('T', ' ')}", style="dim")
             label.append(f"  ·  {s.file_count} files", style="dim")
+            # Per-session diff summary: how the working tree stands
+            # against *this* baseline (in sync / +A/-B lines).
+            if app is not None and hasattr(app, "_session_diff_stats"):
+                changed, a, r = app._session_diff_stats(s.id)
+                if changed == 0:
+                    label.append("  ·  in sync", style="dim")
+                elif a == 0 and r == 0:
+                    label.append(f"  ·  {changed} file(s) differ", style="dim")
+                else:
+                    label.append(f"  ·  +{a}", style="green")
+                    label.append(f"/-{r}", style="red")
             lv.append(ListItem(Label(label), id=f"sess-{s.id}"))
         if self._sessions:
             lv.index = 0
@@ -1830,6 +1842,14 @@ class AlxEditApp(App):
         screen.dismiss()
         self._refresh_tree()  # .alxedit/<sid> just appeared in the explorer
         return sid
+
+    def _session_diff_stats(self, sid: str) -> tuple[int, int, int]:
+        """(changed files, +lines, -lines) of the working tree vs. a
+        session's baseline — the per-session summary in the picker."""
+        try:
+            return sessions.session_diff_stats(self.root, sid, self._settings)
+        except Exception:
+            return 0, 0, 0
 
     def _activate_session(self, sid: str) -> None:
         """Make *sid* the active session (diff baseline = its mirror)."""

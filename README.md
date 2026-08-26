@@ -93,7 +93,10 @@ copy — not memory, not git.
 - **Startup** — if the working directory has a `.alxedit/` folder with
   sessions you get a picker: open an existing one (it re-baselines the diff
   on that snapshot), create a new one (fresh mirror, with a progress bar),
-  or delete ones you don’t want.
+  or delete ones you don’t want. Every row also shows a live summary of
+  the working tree against *that* baseline — `in sync`, or `+A/-B` lines
+  when it has drifted (a quick way to see which session is closest to
+  “now”).
 - **No `.alxedit/` folder? Basic editor mode.** alxedit2 does *not* copy
   the tree or track changes — it just runs as a plain editor (explorer,
   tabs, syntax highlighting, save). Use the `s` key / **Session** button to

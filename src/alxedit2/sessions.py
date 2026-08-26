@@ -19,6 +19,7 @@ settings ignore, ``__pycache__``/``node_modules``, and files larger than
 
 from __future__ import annotations
 
+import difflib
 import json
 import secrets
 import shutil
@@ -157,6 +158,93 @@ def list_sessions(root: Path) -> list[Session]:
 
 def delete_session(root: Path, sid: str) -> None:
     shutil.rmtree(session_dir(root, sid))
+
+
+#: How many files :func:`session_diff_stats` diffs before giving up
+#: (keeps the session picker snappy on huge trees).
+MAX_DIFF_FILES: int = 5000
+
+
+def _line_count(data: bytes) -> int:
+    """Lines in *data* (a trailing newline does not add an empty line)."""
+    if not data:
+        return 0
+    n = data.count(b"\n")
+    return n + (0 if data.endswith(b"\n") else 1)
+
+
+def _line_diff(old: str, new: str) -> tuple[int, int]:
+    """Lines added / removed going from *old* to *new* (difflib)."""
+    added = removed = 0
+    matcher = difflib.SequenceMatcher(
+        None, old.splitlines(), new.splitlines(), autojunk=False
+    )
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("replace", "delete"):
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            added += j2 - j1
+    return added, removed
+
+
+def session_diff_stats(
+    root: Path, sid: str, settings: Optional[project_settings.Settings] = None
+) -> tuple[int, int, int]:
+    """Working tree vs. the session's mirror: ``(changed, added, removed)``.
+
+    *changed* counts files whose on-disk content differs from the mirror
+    copy (or where only one side exists). *added* / *removed* are the
+    line-based totals (difflib, mirror → disk), so ``+A/-B`` reads as
+    "the working tree is A lines bigger, B lines smaller than this
+    baseline". Identical files are compared byte-for-byte and skipped;
+    binary files count as changed without line counts. Capped at
+    :data:`MAX_DIFF_FILES` files so the picker stays responsive.
+    """
+    root = Path(root)
+    files_dir = _files_dir(root, sid)
+    st = settings if settings is not None else project_settings.Settings()
+
+    mirror_rels: set[str] = set()
+    if files_dir.is_dir():
+        for p in files_dir.rglob("*"):
+            if p.is_file():
+                mirror_rels.add(p.relative_to(files_dir).as_posix())
+
+    disk_rels: set[str] = set()
+    for p in iter_tracked_files(root, st):
+        disk_rels.add(p.relative_to(root).as_posix())
+
+    changed = added = removed = 0
+    for n, rel in enumerate(sorted(mirror_rels | disk_rels)):
+        if n >= MAX_DIFF_FILES:
+            break
+        try:
+            disk = (root / rel).read_bytes()
+        except OSError:
+            disk = None
+        try:
+            base = (files_dir / rel).read_bytes()
+        except OSError:
+            base = None
+        if disk is not None and disk == base:
+            continue
+        changed += 1
+        if disk is None and base is not None:
+            removed += _line_count(base)  # deleted on disk
+            continue
+        if base is None and disk is not None:
+            added += _line_count(disk)  # new since the session
+            continue
+        if disk is None:
+            continue
+        try:
+            a, b = disk.decode("utf-8"), base.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            continue  # binary: file counted, lines not
+        da, dr = _line_diff(b, a)
+        added += da
+        removed += dr
+    return changed, added, removed
 
 
 def session_label(root: Path, sid: str) -> str:

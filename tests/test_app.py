@@ -770,6 +770,43 @@ async def test_cannot_delete_active_session(repo: Path) -> None:
         assert app.session_id == active
 
 
+async def test_session_picker_shows_diff_summary(repo: Path) -> None:
+    """Each picker row summarizes the working tree vs. that baseline."""
+    app = AlxEditApp(root=repo)
+    async with app.run_test(size=(200, 30)) as pilot:
+        await pilot.pause()
+        assert app.session_id is not None
+
+        def text() -> str:
+            return "\n".join(
+                strip.text.rstrip()
+                for strip in app.screen._compositor.render_strips(app.screen.size)
+            )
+
+        # in sync: the (only) session matches the tree exactly
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        assert "in sync" in text()
+        app.screen.query_one("#sess-cancel", Button).press()
+        await pilot.pause()
+
+        # one tracked change: a line replaced by two lines -> +2/-1
+        (repo / "src" / "hello.py").write_text(
+            "def hello():\n    return 'bye'\n    # extra\n"
+        )
+        app._watch_tick()
+        assert await _wait_for(pilot, lambda: bool(app._changes))
+
+        app.action_sessions()
+        await pilot.pause()
+        assert isinstance(app.screen, SessionScreen)
+        t = text()
+        assert "+2" in t
+        assert "/-1" in t
+        assert "in sync" not in t
+
+
 async def test_explorer_refreshes_on_session_create_and_delete(repo: Path) -> None:
     """The explorer picks up .alxedit/<sid> when a session is created and
     drops it when one is deleted — no manual tree refresh needed."""
