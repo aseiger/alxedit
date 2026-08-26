@@ -1162,7 +1162,7 @@ async def test_external_edit_of_open_clean_file_shows_diff_then_adopts(
         # the tab immediately shows the inline diff review
         assert buf.external is True
         assert area in app._inline_diff
-        assert area.is_read_only  # review mode while hunks are pending
+        assert area.read_only  # review mode while hunks are pending
         # one-line change: a modified pair, both sides marked M
         assert "M const a = 1" in area.text  # old line: yellow, struck
         assert "M const a = 999" in area.text  # new line: yellow
@@ -1198,7 +1198,7 @@ async def test_external_edit_of_dirty_file_shows_diff_then_restores(repo: Path) 
         # line stays real content
         assert buf.external is True
         assert area in app._inline_diff
-        assert area.is_read_only  # review mode while hunks are pending
+        assert area.read_only  # review mode while hunks are pending
         assert "M const a = 999" in area.text
         assert "M const a = 'mine'" in area.text
         rec = app._changes[repo / "app.js"]
@@ -1771,7 +1771,7 @@ async def test_inline_diff_in_editor_and_esc_restores(repo: Path) -> None:
 
         # the diff appears automatically, no key press needed
         assert area in app._inline_diff
-        assert area.is_read_only  # review mode while hunks are pending
+        assert area.read_only  # review mode while hunks are pending
         assert "M const a = 1" in area.text
         assert "M const a = 999" in area.text
 
@@ -1779,7 +1779,7 @@ async def test_inline_diff_in_editor_and_esc_restores(repo: Path) -> None:
         await pilot.press("ctrl+d")
         await pilot.pause()
         assert area not in app._inline_diff
-        assert not area.is_read_only
+        assert not area.read_only
         assert area.text == "const a = 999;\n"  # clean buffer adopted disk
 
         # abandoning the review is NOT a decision: the change stays
@@ -1951,7 +1951,7 @@ async def test_hunk_theirs_mine_clean_buffer(repo: Path) -> None:
 
         # all decided: review ends, the tab is editable, content resolved
         assert area not in app._inline_diff
-        assert not area.is_read_only
+        assert not area.read_only
         assert not bar.display
         assert area.text == "one\nTWO\nthree\n"
 
@@ -2216,7 +2216,7 @@ async def test_hunk_mine_keeps_dirty_edits(repo: Path) -> None:
         app._on_hunk_button("hunk-0-mine")
         await pilot.pause()
         assert area not in app._inline_diff
-        assert not area.is_read_only
+        assert not area.read_only
         assert area.text == "const a = 'mine';\n"
 
         app.action_save()

@@ -10,6 +10,7 @@ import asyncio
 import difflib
 import shutil
 import time
+import inspect
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -1174,7 +1175,7 @@ class SessionScreen(ModalScreen[SessionChoice]):
                 else:
                     label.append(f"  ·  +{a}", style="green")
                     label.append(f"/-{r}", style="red")
-            lv.append(ListItem(Label(label), id=f"sess-{s.id}"))
+            await lv.append(ListItem(Label(label), id=f"sess-{s.id}"))
         if self._sessions:
             lv.index = 0
 
@@ -1527,13 +1528,13 @@ class ChangesScreen(Screen):
         event.stop()
         await self.action_view_diff()
 
-    def _rebuild(self) -> None:
+    async def _rebuild(self) -> None:
         app = self.app
         lv = self.query_one("#changes-list", ListView)
-        lv.clear()
         records = sorted(app._changes.values(), key=lambda r: r.path)
+        await lv.clear()
         if not records:
-            lv.append(ListItem(Label("  (no external changes tracked)")))
+            await lv.append(ListItem(Label("  (no external changes tracked)")))
             return
         for rec in records:
             char, style = {
@@ -1544,7 +1545,7 @@ class ChangesScreen(Screen):
             label = Text()
             label.append(f" {char}  ", style=style)
             label.append(app._rel(rec.path))
-            lv.append(ListItem(Label(label)))
+            await lv.append(ListItem(Label(label)))
 
     def _selected(self) -> Optional[Path]:
         records = sorted(self.app._changes.values(), key=lambda r: r.path)
@@ -1611,9 +1612,9 @@ class ChangesScreen(Screen):
     def action_back(self) -> None:
         self.dismiss()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.app._subscribe_changes(self._rebuild)
-        self._rebuild()
+        await self._rebuild()
 
     def on_unmount(self) -> None:
         self.app._unsubscribe_changes(self._rebuild)
@@ -2483,7 +2484,9 @@ class AlxEditApp(App):
         area = self.active_area
         if area is None:
             return
-        if area.read_only:
+        # Session-store files are truly read-only. The inline diff view is
+        # read-only for typing, but saving IS the way to resolve it.
+        if area.read_only and area not in self._inline_diff:
             self.notify(
                 "opened read-only (session store)", title="Save"
             )
@@ -2601,16 +2604,28 @@ class AlxEditApp(App):
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    def _has_screen_on_stack(self, cls: type) -> bool:
+        """True if a screen of *cls* is already on the active stack."""
+        return any(isinstance(s, cls) for s in self._screen_stack)
+
     def action_changes(self) -> None:
         """Open the external-changes list (approve / reject / review)."""
+        # Idempotent: a late-arriving press must not stack another
+        # copy on top of a modal (or the screen that is already open).
+        if self._has_screen_on_stack(ChangesScreen):
+            return
         self.push_screen(ChangesScreen())
 
     def action_sessions(self) -> None:
         """Top-bar Session button: switch to / create / delete sessions."""
+        if self._has_screen_on_stack(SessionScreen):
+            return
         self._run_modal(self._do_session_pick())
 
     def action_settings(self) -> None:
         """Top-bar Settings button: what the session mirror tracks."""
+        if self._has_screen_on_stack(SettingsScreen):
+            return
         self.push_screen(
             SettingsScreen(self.root, self._settings, self._apply_settings)
         )
@@ -2873,7 +2888,7 @@ class AlxEditApp(App):
     def _set_readonly(area: TextArea, state: InlineDiffState) -> None:
         # While any hunk is pending the tab is under review (the hunk bar
         # decides); once every hunk is decided it is a normal editor again.
-        area.is_read_only = any(hunk.decision is None for hunk in state.hunks)
+        area.read_only = any(hunk.decision is None for hunk in state.hunks)
 
     def _show_hunkbar(self, show: bool) -> None:
         self.query_one("#hunkbar", HunkBar).display = show
@@ -3013,7 +3028,7 @@ class AlxEditApp(App):
     def _finish_review(self, area: TextArea, state: InlineDiffState) -> None:
         """Every hunk decided: settle the decision and drop the diff state."""
         self._inline_diff.pop(area, None)
-        area.is_read_only = False
+        area.read_only = False
         area.language = state.language
         area.theme = state.theme
         self._show_hunkbar(False)
@@ -3080,7 +3095,7 @@ class AlxEditApp(App):
             area.load_text(state.backup_text)
             if buf is not None:
                 self._recompute_flags(buf, area)
-        area.is_read_only = False
+        area.read_only = False
         area.language = state.language
         area.theme = state.theme
         self._show_hunkbar(False)
@@ -3094,7 +3109,7 @@ class AlxEditApp(App):
             return
         buf = self.buffers.get(area)
         area.load_text(buf.saved_text if buf is not None else "")
-        area.is_read_only = False
+        area.read_only = False
         area.language = state.language
         area.theme = state.theme
         self._show_hunkbar(False)
@@ -3548,7 +3563,7 @@ class AlxEditApp(App):
             if diff_state is not None:
                 area.language = diff_state.language
                 area.theme = diff_state.theme
-            area.is_read_only = False
+            area.read_only = False
             buf.external = False
             self._retab(area)
             self._show_hunkbar(False)
@@ -3707,7 +3722,7 @@ class AlxEditApp(App):
             if diff_state is not None:
                 area.language = diff_state.language
                 area.theme = diff_state.theme
-            area.is_read_only = False
+            area.read_only = False
             if rec.status == "deleted":
                 # Adopt the deletion: empty the buffer, clear both indicators.
                 area.load_text("")
@@ -3759,13 +3774,37 @@ class AlxEditApp(App):
         self._refresh_changes_button()
         for callback in list(self._change_listeners):
             try:
-                callback()
+                result = callback()
             except Exception:
-                pass
+                continue
+            if inspect.isawaitable(result):
+                # Textual 8 list rebuilds are async (awaiting the
+                # append/clear performs the layout reflow). Run them
+                # on the event loop, strictly after any previously
+                # enqueued rebuild so ordering is preserved.
+                self._enqueue_change_task(result)
         try:
             self._statusbar_refresh()
         except Exception:
             pass
+
+    def _enqueue_change_task(self, awaitable) -> None:
+        previous = getattr(self, "_last_change_task", None)
+
+        async def runner() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except Exception:
+                    pass
+            await awaitable
+
+        try:
+            task = asyncio.get_running_loop().create_task(runner())
+        except RuntimeError:
+            awaitable.close()
+            return
+        self._last_change_task = task
 
     # ------------------------------------------------------------------ #
     # events
